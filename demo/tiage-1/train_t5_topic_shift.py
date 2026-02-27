@@ -24,24 +24,12 @@ class Sample:
     label: int
     centrality: float
     community_ratio: float
-    delta_centrality: float
-    community_changed: float
-    ctx_resp_sim: float
 
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-
-def lexical_jaccard(a: str, b: str) -> float:
-    a_set = set(a.lower().split())
-    b_set = set(b.lower().split())
-    union = a_set | b_set
-    if not union:
-        return 0.0
-    return float(len(a_set & b_set)) / float(len(union))
 
 
 def parse_nodes(nodes_csv: Path) -> List[dict]:
@@ -159,17 +147,6 @@ def build_samples(
 
             cur_c = centrality.get(cur["node_id"], 0.0)
             cur_m = community_ratio.get(cur["node_id"], 0.0)
-            prev_c = 0.0
-            prev_m = 0.0
-            prev_text = ""
-            if hist:
-                prev_node = hist[-1]["node_id"]
-                prev_c = centrality.get(prev_node, 0.0)
-                prev_m = community_ratio.get(prev_node, 0.0)
-                prev_text = hist[-1]["text"]
-            delta_c = cur_c - prev_c
-            com_changed = 1.0 if abs(cur_m - prev_m) > 1e-8 else 0.0
-            sim = lexical_jaccard(prev_text, cur["text"]) if prev_text else 0.0
 
             context_text = " </s> ".join(ctx_parts) if ctx_parts else "<no_context>"
             text = (
@@ -187,9 +164,6 @@ def build_samples(
                 label=label,
                 centrality=cur_c,
                 community_ratio=cur_m,
-                delta_centrality=delta_c,
-                community_changed=com_changed,
-                ctx_resp_sim=sim,
             )
             if split in result:
                 result[split].append(sample)
@@ -223,13 +197,7 @@ class Collator:
             return_tensors="pt",
         )
         labels = torch.tensor([x.label for x in batch], dtype=torch.long)
-        feats = torch.tensor(
-            [
-                [x.centrality, x.community_ratio, x.delta_centrality, x.community_changed, x.ctx_resp_sim]
-                for x in batch
-            ],
-            dtype=torch.float,
-        )
+        feats = torch.tensor([[x.centrality, x.community_ratio] for x in batch], dtype=torch.float)
 
         return {
             "input_ids": tok["input_ids"],
@@ -268,7 +236,7 @@ class T5ShiftClassifier(nn.Module):
         channelmix_layers: int = 1,
         channelmix_hidden_mult: int = 4,
         channelmix_dropout: float = 0.1,
-        num_extra_features: int = 5,
+        num_extra_features: int = 2,
     ):
         super().__init__()
         self.encoder = T5EncoderModel.from_pretrained(model_name)
@@ -381,9 +349,6 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, thresho
                     "prob_1": float(p1),
                     "centrality": float(m.centrality),
                     "community_ratio": float(m.community_ratio),
-                    "delta_centrality": float(m.delta_centrality),
-                    "community_changed": float(m.community_changed),
-                    "ctx_resp_sim": float(m.ctx_resp_sim),
                 }
             )
 
@@ -521,7 +486,6 @@ def main() -> None:
         channelmix_layers=args.channelmix_layers,
         channelmix_hidden_mult=args.channelmix_hidden_mult,
         channelmix_dropout=args.channelmix_dropout,
-        num_extra_features=5,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -625,20 +589,7 @@ def main() -> None:
     save_csv(
         output_dir / "predictions.csv",
         train_rows + dev_rows + test_rows,
-        [
-            "split",
-            "dialog_id",
-            "turn_id",
-            "node_id",
-            "label",
-            "pred",
-            "prob_1",
-            "centrality",
-            "community_ratio",
-            "delta_centrality",
-            "community_changed",
-            "ctx_resp_sim",
-        ],
+        ["split", "dialog_id", "turn_id", "node_id", "label", "pred", "prob_1", "centrality", "community_ratio"],
     )
 
     print("[RESULT] Test metrics")
