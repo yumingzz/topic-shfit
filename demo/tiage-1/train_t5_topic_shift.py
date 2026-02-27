@@ -20,7 +20,8 @@ class Sample:
     dialog_id: int
     turn_id: int
     node_id: int
-    text: str
+    context_text: str
+    response_text: str
     label: int
     centrality: float
     community_ratio: float
@@ -149,18 +150,19 @@ def build_samples(
             cur_m = community_ratio.get(cur["node_id"], 0.0)
 
             context_text = " </s> ".join(ctx_parts) if ctx_parts else "<no_context>"
-            text = (
+            context_input = (
                 f"task: topic shift detection\\n"
-                f"context: {context_text}\\n"
-                f"response: {cur['text']} [CEN={cur_c:.4f}] [COM={cur_m:.4f}]"
+                f"context: {context_text}"
             )
+            response_input = f"response: {cur['text']}"
 
             sample = Sample(
                 split=split,
                 dialog_id=cur["dialog_id"],
                 turn_id=cur["turn_id"],
                 node_id=cur["node_id"],
-                text=text,
+                context_text=context_input,
+                response_text=response_input,
                 label=label,
                 centrality=cur_c,
                 community_ratio=cur_m,
@@ -183,25 +185,36 @@ class TiageDataset(Dataset):
 
 
 class Collator:
-    def __init__(self, tokenizer, max_length: int):
+    def __init__(self, tokenizer, max_length: int, response_max_length: int):
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.response_max_length = response_max_length
 
     def __call__(self, batch: List[Sample]) -> dict:
-        texts = [x.text for x in batch]
-        tok = self.tokenizer(
-            texts,
+        context_texts = [x.context_text for x in batch]
+        response_texts = [x.response_text for x in batch]
+        tok_ctx = self.tokenizer(
+            context_texts,
             padding=True,
             truncation=True,
             max_length=self.max_length,
+            return_tensors="pt",
+        )
+        tok_rsp = self.tokenizer(
+            response_texts,
+            padding=True,
+            truncation=True,
+            max_length=self.response_max_length,
             return_tensors="pt",
         )
         labels = torch.tensor([x.label for x in batch], dtype=torch.long)
         feats = torch.tensor([[x.centrality, x.community_ratio] for x in batch], dtype=torch.float)
 
         return {
-            "input_ids": tok["input_ids"],
-            "attention_mask": tok["attention_mask"],
+            "context_input_ids": tok_ctx["input_ids"],
+            "context_attention_mask": tok_ctx["attention_mask"],
+            "response_input_ids": tok_rsp["input_ids"],
+            "response_attention_mask": tok_rsp["attention_mask"],
             "labels": labels,
             "extra_features": feats,
             "meta": batch,
@@ -253,32 +266,58 @@ class T5ShiftClassifier(nn.Module):
             ]
         )
         self.feature_norm = nn.LayerNorm(num_extra_features)
+        self.pair_proj = nn.Sequential(
+            nn.Linear(hidden * 4, hidden),
+            nn.Tanh(),
+            nn.Dropout(dropout),
+        )
+        self.graph_proj = nn.Sequential(
+            nn.Linear(num_extra_features, hidden),
+            nn.Tanh(),
+            nn.Dropout(dropout),
+        )
+        self.gate = nn.Linear(hidden * 2, hidden)
         self.classifier = nn.Sequential(
-            nn.Linear(hidden + num_extra_features, hidden),
+            nn.Linear(hidden, hidden),
             nn.Tanh(),
             nn.Dropout(dropout),
             nn.Linear(hidden, 2),
         )
 
-    def forward(
+    def _encode_and_pool(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        extra_features: torch.Tensor,
-        labels: torch.Tensor = None,
-        class_weights: torch.Tensor = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
         hs = out.last_hidden_state
         if self.use_channelmix:
             for block in self.channelmix_stack:
                 hs = block(hs)
-
         mask = attention_mask.unsqueeze(-1).float()
         pooled = (hs * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
+        return pooled
 
+    def forward(
+        self,
+        context_input_ids: torch.Tensor,
+        context_attention_mask: torch.Tensor,
+        response_input_ids: torch.Tensor,
+        response_attention_mask: torch.Tensor,
+        extra_features: torch.Tensor,
+        labels: torch.Tensor = None,
+        class_weights: torch.Tensor = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        h_c = self._encode_and_pool(context_input_ids, context_attention_mask)
+        h_r = self._encode_and_pool(response_input_ids, response_attention_mask)
+        h_abs = torch.abs(h_c - h_r)
+        h_mul = h_c * h_r
+        h_pair = self.pair_proj(torch.cat([h_c, h_r, h_abs, h_mul], dim=-1))
         feats = self.feature_norm(extra_features)
-        logits = self.classifier(torch.cat([pooled, feats], dim=-1))
+        h_graph = self.graph_proj(feats)
+        gate = torch.sigmoid(self.gate(torch.cat([h_pair, h_graph], dim=-1)))
+        h_fused = gate * h_pair + (1.0 - gate) * h_graph
+        logits = self.classifier(h_fused)
 
         loss = None
         if labels is not None:
@@ -318,14 +357,18 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, thresho
     pred_rows: List[dict] = []
 
     for batch in loader:
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
+        context_input_ids = batch["context_input_ids"].to(device)
+        context_attention_mask = batch["context_attention_mask"].to(device)
+        response_input_ids = batch["response_input_ids"].to(device)
+        response_attention_mask = batch["response_attention_mask"].to(device)
         labels = batch["labels"].to(device)
         extra_features = batch["extra_features"].to(device)
 
         _, logits = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
+            context_input_ids=context_input_ids,
+            context_attention_mask=context_attention_mask,
+            response_input_ids=response_input_ids,
+            response_attention_mask=response_attention_mask,
             extra_features=extra_features,
             labels=labels,
         )
@@ -377,13 +420,17 @@ def find_best_threshold(
     y_true: List[int] = []
     prob_1: List[float] = []
     for batch in loader:
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
+        context_input_ids = batch["context_input_ids"].to(device)
+        context_attention_mask = batch["context_attention_mask"].to(device)
+        response_input_ids = batch["response_input_ids"].to(device)
+        response_attention_mask = batch["response_attention_mask"].to(device)
         labels = batch["labels"].to(device)
         extra_features = batch["extra_features"].to(device)
         _, logits = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
+            context_input_ids=context_input_ids,
+            context_attention_mask=context_attention_mask,
+            response_input_ids=response_input_ids,
+            response_attention_mask=response_attention_mask,
             extra_features=extra_features,
             labels=labels,
         )
@@ -429,11 +476,12 @@ def main() -> None:
     parser.add_argument("--slices_txt_dir", type=str, default="demo/tiage-1/tiage_slices_txt")
     parser.add_argument("--output_dir", type=str, default="demo/tiage-1/results_t5_topic_shift")
     parser.add_argument("--model_name", type=str, default="t5-small")
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_length", type=int, default=384)
+    parser.add_argument("--response_max_length", type=int, default=128)
     parser.add_argument("--context_turns", type=int, default=16)
     parser.add_argument("--num_slices", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
@@ -467,6 +515,7 @@ def main() -> None:
     print(
         f"[INFO] model={args.model_name} use_channelmix={args.use_channelmix} "
         f"channelmix_layers={args.channelmix_layers} max_length={args.max_length} "
+        f"response_max_length={args.response_max_length} "
         f"context_turns={args.context_turns} batch_size={args.batch_size}"
     )
 
@@ -492,7 +541,7 @@ def main() -> None:
     model.to(device)
     print(f"[INFO] device={device}")
 
-    collator = Collator(tokenizer, args.max_length)
+    collator = Collator(tokenizer, args.max_length, args.response_max_length)
 
     train_loader = DataLoader(TiageDataset(split_samples["train"]), batch_size=args.batch_size, shuffle=True, collate_fn=collator)
     dev_loader = DataLoader(TiageDataset(split_samples["dev"]), batch_size=args.batch_size, shuffle=False, collate_fn=collator)
@@ -519,14 +568,18 @@ def main() -> None:
         total_loss = 0.0
 
         for batch in train_loader:
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
+            context_input_ids = batch["context_input_ids"].to(device)
+            context_attention_mask = batch["context_attention_mask"].to(device)
+            response_input_ids = batch["response_input_ids"].to(device)
+            response_attention_mask = batch["response_attention_mask"].to(device)
             labels = batch["labels"].to(device)
             extra_features = batch["extra_features"].to(device)
 
             loss, _ = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
+                context_input_ids=context_input_ids,
+                context_attention_mask=context_attention_mask,
+                response_input_ids=response_input_ids,
+                response_attention_mask=response_attention_mask,
                 extra_features=extra_features,
                 labels=labels,
                 class_weights=class_weights,
