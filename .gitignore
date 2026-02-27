@@ -1,0 +1,29 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.env
+.idea/
+.vscode/
+dist/
+build/
+demo/tiage-1/results_t5_base_channelmix/
+demo/tiage-1/results_t5_base_channelmix_v2/
+demo/tiage-1/results_t5_topic_shift/
+# models / checkpoints
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.csv
+results_t5_*/
+**/best_model.pt
+
+demo/tiage-1/data/
+# datasets / large raw data
+**/*.txt
+**/*.csv
+*.log
+# outputs
+outputs_nodes/
