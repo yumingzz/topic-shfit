@@ -10,7 +10,7 @@ import networkx as nx
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from transformers import AutoTokenizer, T5EncoderModel, get_linear_schedule_with_warmup
 
 
@@ -25,12 +25,22 @@ class Sample:
     label: int
     centrality: float
     community_ratio: float
+    prev1_sim: float
+    prev2_sim: float
 
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def lexical_jaccard(a: str, b: str) -> float:
+    ta = set(a.lower().split())
+    tb = set(b.lower().split())
+    if not ta and not tb:
+        return 0.0
+    return float(len(ta & tb)) / float(max(1, len(ta | tb)))
 
 
 def parse_nodes(nodes_csv: Path) -> List[dict]:
@@ -148,11 +158,18 @@ def build_samples(
 
             cur_c = centrality.get(cur["node_id"], 0.0)
             cur_m = community_ratio.get(cur["node_id"], 0.0)
+            prev1_text = turns[i - 1]["text"] if i - 1 >= 0 else "<none>"
+            prev2_text = turns[i - 2]["text"] if i - 2 >= 0 else "<none>"
+            prev1_sim = lexical_jaccard(cur["text"], prev1_text) if i - 1 >= 0 else 0.0
+            prev2_sim = lexical_jaccard(cur["text"], prev2_text) if i - 2 >= 0 else 0.0
 
             context_text = " </s> ".join(ctx_parts) if ctx_parts else "<no_context>"
             context_input = (
                 f"task: topic shift detection\\n"
-                f"context: {context_text}"
+                f"context: {context_text}\\n"
+                f"contrast_prev1: {prev1_text}\\n"
+                f"contrast_prev2: {prev2_text}\\n"
+                f"sim_prev1: {prev1_sim:.4f} sim_prev2: {prev2_sim:.4f}"
             )
             response_input = f"response: {cur['text']}"
 
@@ -166,6 +183,8 @@ def build_samples(
                 label=label,
                 centrality=cur_c,
                 community_ratio=cur_m,
+                prev1_sim=prev1_sim,
+                prev2_sim=prev2_sim,
             )
             if split in result:
                 result[split].append(sample)
@@ -208,7 +227,10 @@ class Collator:
             return_tensors="pt",
         )
         labels = torch.tensor([x.label for x in batch], dtype=torch.long)
-        feats = torch.tensor([[x.centrality, x.community_ratio] for x in batch], dtype=torch.float)
+        feats = torch.tensor(
+            [[x.centrality, x.community_ratio, x.prev1_sim, x.prev2_sim] for x in batch],
+            dtype=torch.float,
+        )
 
         return {
             "context_input_ids": tok_ctx["input_ids"],
@@ -249,7 +271,7 @@ class T5ShiftClassifier(nn.Module):
         channelmix_layers: int = 1,
         channelmix_hidden_mult: int = 4,
         channelmix_dropout: float = 0.1,
-        num_extra_features: int = 2,
+        num_extra_features: int = 4,
     ):
         super().__init__()
         self.encoder = T5EncoderModel.from_pretrained(model_name)
@@ -461,6 +483,16 @@ def compute_class_weights(train_samples: List[Sample]) -> torch.Tensor:
     return torch.tensor([w0, w1], dtype=torch.float)
 
 
+def build_oversample_sampler(train_samples: List[Sample]) -> WeightedRandomSampler:
+    # Inverse-frequency sampling to oversample label=1 in each epoch.
+    count0 = sum(1 for s in train_samples if s.label == 0)
+    count1 = sum(1 for s in train_samples if s.label == 1)
+    w0 = 1.0 / max(1, count0)
+    w1 = 1.0 / max(1, count1)
+    weights = [w1 if s.label == 1 else w0 for s in train_samples]
+    return WeightedRandomSampler(weights=weights, num_samples=len(train_samples), replacement=True)
+
+
 def save_csv(path: Path, rows: List[dict], fieldnames: List[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as f:
@@ -490,8 +522,8 @@ def main() -> None:
     parser.add_argument("--channelmix_layers", type=int, default=1)
     parser.add_argument("--channelmix_hidden_mult", type=int, default=4)
     parser.add_argument("--channelmix_dropout", type=float, default=0.1)
-    parser.add_argument("--early_stop_patience", type=int, default=6)
     parser.add_argument("--no_class_weights", action="store_true", help="Disable class-weighted cross-entropy.")
+    parser.add_argument("--no_oversample_train", action="store_true", help="Disable training oversampling for label=1.")
     parser.add_argument("--thr_min", type=float, default=0.30)
     parser.add_argument("--thr_max", type=float, default=0.70)
     parser.add_argument("--thr_step", type=float, default=0.01)
@@ -543,12 +575,25 @@ def main() -> None:
 
     collator = Collator(tokenizer, args.max_length, args.response_max_length)
 
-    train_loader = DataLoader(TiageDataset(split_samples["train"]), batch_size=args.batch_size, shuffle=True, collate_fn=collator)
-    dev_loader = DataLoader(TiageDataset(split_samples["dev"]), batch_size=args.batch_size, shuffle=False, collate_fn=collator)
-    test_loader = DataLoader(TiageDataset(split_samples["test"]), batch_size=args.batch_size, shuffle=False, collate_fn=collator)
+    train_dataset = TiageDataset(split_samples["train"])
+    dev_dataset = TiageDataset(split_samples["dev"])
+    test_dataset = TiageDataset(split_samples["test"])
+
+    train_sampler = None if args.no_oversample_train else build_oversample_sampler(split_samples["train"])
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        collate_fn=collator,
+    )
+    train_eval_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collator)
+    dev_loader = DataLoader(dev_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collator)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collator)
     class_weights = None if args.no_class_weights else compute_class_weights(split_samples["train"]).to(device)
     if class_weights is not None:
         print(f"[INFO] class_weights=[{class_weights[0].item():.4f}, {class_weights[1].item():.4f}]")
+    print(f"[INFO] oversample_train={not args.no_oversample_train}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     total_steps = len(train_loader) * args.epochs
@@ -560,7 +605,6 @@ def main() -> None:
 
     best_dev = -1.0
     best_epoch = 0
-    no_improve_count = 0
     best_path = output_dir / "best_model.pt"
 
     for epoch in range(1, args.epochs + 1):
@@ -603,13 +647,7 @@ def main() -> None:
         if dev_metrics["macro_f1"] > best_dev:
             best_dev = dev_metrics["macro_f1"]
             best_epoch = epoch
-            no_improve_count = 0
             torch.save(model.state_dict(), best_path)
-        else:
-            no_improve_count += 1
-            if no_improve_count >= args.early_stop_patience:
-                print(f"[INFO] Early stopping at epoch={epoch}, best_epoch={best_epoch}, best_dev_MacroF1={best_dev:.4f}")
-                break
 
     print(f"[INFO] best dev Macro-F1={best_dev:.4f} at epoch={best_epoch}")
 
@@ -624,7 +662,7 @@ def main() -> None:
     )
     print(f"[INFO] best_threshold_on_dev={best_threshold:.2f}")
 
-    train_metrics, train_rows = evaluate(model, train_loader, device, threshold=best_threshold)
+    train_metrics, train_rows = evaluate(model, train_eval_loader, device, threshold=best_threshold)
     dev_metrics, dev_rows = evaluate(model, dev_loader, device, threshold=best_threshold)
     test_metrics, test_rows = evaluate(model, test_loader, device, threshold=best_threshold)
 
