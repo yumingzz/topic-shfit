@@ -20,27 +20,15 @@ class Sample:
     dialog_id: int
     turn_id: int
     node_id: int
-    context_text: str
-    response_text: str
+    text: str
     label: int
     centrality: float
-    community_ratio: float
-    prev1_sim: float
-    prev2_sim: float
 
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-
-def lexical_jaccard(a: str, b: str) -> float:
-    ta = set(a.lower().split())
-    tb = set(b.lower().split())
-    if not ta and not tb:
-        return 0.0
-    return float(len(ta & tb)) / float(max(1, len(ta | tb)))
 
 
 def parse_nodes(nodes_csv: Path) -> List[dict]:
@@ -101,8 +89,9 @@ def compute_louvain_feature(
     node_slice: Dict[int, int],
     num_slices: int,
     seed: int,
-) -> Dict[int, float]:
+) -> Tuple[Dict[int, float], Dict[int, float]]:
     community_ratio: Dict[int, float] = {}
+    bridge_ratio: Dict[int, float] = {}
 
     for sid in range(num_slices):
         nodes = [nid for nid, s in node_slice.items() if s == sid]
@@ -123,14 +112,29 @@ def compute_louvain_feature(
             ratio = len(comm) / total
             for nid in comm:
                 community_ratio[int(nid)] = ratio
+        node_to_comm: Dict[int, int] = {}
+        for ci, comm in enumerate(communities):
+            for nid in comm:
+                node_to_comm[int(nid)] = ci
+        eps = 1e-8
+        for nid in g.nodes():
+            deg_in = 0
+            deg_out = 0
+            c_nid = node_to_comm.get(int(nid), -1)
+            for nb in g.neighbors(nid):
+                if node_to_comm.get(int(nb), -2) == c_nid:
+                    deg_in += 1
+                else:
+                    deg_out += 1
+            deg_all = deg_in + deg_out
+            bridge_ratio[int(nid)] = float(deg_out) / float(deg_all + eps)
 
-    return community_ratio
+    return community_ratio, bridge_ratio
 
 
 def build_samples(
     rows: List[dict],
     centrality: Dict[int, float],
-    community_ratio: Dict[int, float],
     context_turns: int,
 ) -> Dict[str, List[Sample]]:
     by_dialog: Dict[Tuple[str, int], List[dict]] = {}
@@ -153,38 +157,25 @@ def build_samples(
             ctx_parts: List[str] = []
             for h in hist:
                 h_c = centrality.get(h["node_id"], 0.0)
-                h_m = community_ratio.get(h["node_id"], 0.0)
-                ctx_parts.append(f"{h['text']} [CEN={h_c:.4f}] [COM={h_m:.4f}]")
+                ctx_parts.append(f"{h['text']} [CEN={h_c:.4f}]")
 
             cur_c = centrality.get(cur["node_id"], 0.0)
-            cur_m = community_ratio.get(cur["node_id"], 0.0)
-            prev1_text = turns[i - 1]["text"] if i - 1 >= 0 else "<none>"
-            prev2_text = turns[i - 2]["text"] if i - 2 >= 0 else "<none>"
-            prev1_sim = lexical_jaccard(cur["text"], prev1_text) if i - 1 >= 0 else 0.0
-            prev2_sim = lexical_jaccard(cur["text"], prev2_text) if i - 2 >= 0 else 0.0
 
             context_text = " </s> ".join(ctx_parts) if ctx_parts else "<no_context>"
-            context_input = (
+            text = (
                 f"task: topic shift detection\\n"
                 f"context: {context_text}\\n"
-                f"contrast_prev1: {prev1_text}\\n"
-                f"contrast_prev2: {prev2_text}\\n"
-                f"sim_prev1: {prev1_sim:.4f} sim_prev2: {prev2_sim:.4f}"
+                f"response: {cur['text']} [CEN={cur_c:.4f}]"
             )
-            response_input = f"response: {cur['text']}"
 
             sample = Sample(
                 split=split,
                 dialog_id=cur["dialog_id"],
                 turn_id=cur["turn_id"],
                 node_id=cur["node_id"],
-                context_text=context_input,
-                response_text=response_input,
+                text=text,
                 label=label,
                 centrality=cur_c,
-                community_ratio=cur_m,
-                prev1_sim=prev1_sim,
-                prev2_sim=prev2_sim,
             )
             if split in result:
                 result[split].append(sample)
@@ -204,39 +195,25 @@ class TiageDataset(Dataset):
 
 
 class Collator:
-    def __init__(self, tokenizer, max_length: int, response_max_length: int):
+    def __init__(self, tokenizer, max_length: int):
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.response_max_length = response_max_length
 
     def __call__(self, batch: List[Sample]) -> dict:
-        context_texts = [x.context_text for x in batch]
-        response_texts = [x.response_text for x in batch]
-        tok_ctx = self.tokenizer(
-            context_texts,
+        texts = [x.text for x in batch]
+        tok = self.tokenizer(
+            texts,
             padding=True,
             truncation=True,
             max_length=self.max_length,
             return_tensors="pt",
         )
-        tok_rsp = self.tokenizer(
-            response_texts,
-            padding=True,
-            truncation=True,
-            max_length=self.response_max_length,
-            return_tensors="pt",
-        )
         labels = torch.tensor([x.label for x in batch], dtype=torch.long)
-        feats = torch.tensor(
-            [[x.centrality, x.community_ratio, x.prev1_sim, x.prev2_sim] for x in batch],
-            dtype=torch.float,
-        )
+        feats = torch.tensor([[x.centrality] for x in batch], dtype=torch.float)
 
         return {
-            "context_input_ids": tok_ctx["input_ids"],
-            "context_attention_mask": tok_ctx["attention_mask"],
-            "response_input_ids": tok_rsp["input_ids"],
-            "response_attention_mask": tok_rsp["attention_mask"],
+            "input_ids": tok["input_ids"],
+            "attention_mask": tok["attention_mask"],
             "labels": labels,
             "extra_features": feats,
             "meta": batch,
@@ -271,7 +248,7 @@ class T5ShiftClassifier(nn.Module):
         channelmix_layers: int = 1,
         channelmix_hidden_mult: int = 4,
         channelmix_dropout: float = 0.1,
-        num_extra_features: int = 4,
+        num_extra_features: int = 1,
     ):
         super().__init__()
         self.encoder = T5EncoderModel.from_pretrained(model_name)
@@ -288,29 +265,21 @@ class T5ShiftClassifier(nn.Module):
             ]
         )
         self.feature_norm = nn.LayerNorm(num_extra_features)
-        self.pair_proj = nn.Sequential(
-            nn.Linear(hidden * 4, hidden),
-            nn.Tanh(),
-            nn.Dropout(dropout),
-        )
-        self.graph_proj = nn.Sequential(
-            nn.Linear(num_extra_features, hidden),
-            nn.Tanh(),
-            nn.Dropout(dropout),
-        )
-        self.gate = nn.Linear(hidden * 2, hidden)
         self.classifier = nn.Sequential(
-            nn.Linear(hidden, hidden),
+            nn.Linear(hidden + num_extra_features, hidden),
             nn.Tanh(),
             nn.Dropout(dropout),
             nn.Linear(hidden, 2),
         )
 
-    def _encode_and_pool(
+    def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
+        extra_features: torch.Tensor,
+        labels: torch.Tensor = None,
+        class_weights: torch.Tensor = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
         hs = out.last_hidden_state
         if self.use_channelmix:
@@ -318,28 +287,8 @@ class T5ShiftClassifier(nn.Module):
                 hs = block(hs)
         mask = attention_mask.unsqueeze(-1).float()
         pooled = (hs * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
-        return pooled
-
-    def forward(
-        self,
-        context_input_ids: torch.Tensor,
-        context_attention_mask: torch.Tensor,
-        response_input_ids: torch.Tensor,
-        response_attention_mask: torch.Tensor,
-        extra_features: torch.Tensor,
-        labels: torch.Tensor = None,
-        class_weights: torch.Tensor = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        h_c = self._encode_and_pool(context_input_ids, context_attention_mask)
-        h_r = self._encode_and_pool(response_input_ids, response_attention_mask)
-        h_abs = torch.abs(h_c - h_r)
-        h_mul = h_c * h_r
-        h_pair = self.pair_proj(torch.cat([h_c, h_r, h_abs, h_mul], dim=-1))
         feats = self.feature_norm(extra_features)
-        h_graph = self.graph_proj(feats)
-        gate = torch.sigmoid(self.gate(torch.cat([h_pair, h_graph], dim=-1)))
-        h_fused = gate * h_pair + (1.0 - gate) * h_graph
-        logits = self.classifier(h_fused)
+        logits = self.classifier(torch.cat([pooled, feats], dim=-1))
 
         loss = None
         if labels is not None:
@@ -379,18 +328,14 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, thresho
     pred_rows: List[dict] = []
 
     for batch in loader:
-        context_input_ids = batch["context_input_ids"].to(device)
-        context_attention_mask = batch["context_attention_mask"].to(device)
-        response_input_ids = batch["response_input_ids"].to(device)
-        response_attention_mask = batch["response_attention_mask"].to(device)
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device)
         extra_features = batch["extra_features"].to(device)
 
         _, logits = model(
-            context_input_ids=context_input_ids,
-            context_attention_mask=context_attention_mask,
-            response_input_ids=response_input_ids,
-            response_attention_mask=response_attention_mask,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
             extra_features=extra_features,
             labels=labels,
         )
@@ -413,7 +358,6 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, thresho
                     "pred": p,
                     "prob_1": float(p1),
                     "centrality": float(m.centrality),
-                    "community_ratio": float(m.community_ratio),
                 }
             )
 
@@ -442,17 +386,13 @@ def find_best_threshold(
     y_true: List[int] = []
     prob_1: List[float] = []
     for batch in loader:
-        context_input_ids = batch["context_input_ids"].to(device)
-        context_attention_mask = batch["context_attention_mask"].to(device)
-        response_input_ids = batch["response_input_ids"].to(device)
-        response_attention_mask = batch["response_attention_mask"].to(device)
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device)
         extra_features = batch["extra_features"].to(device)
         _, logits = model(
-            context_input_ids=context_input_ids,
-            context_attention_mask=context_attention_mask,
-            response_input_ids=response_input_ids,
-            response_attention_mask=response_attention_mask,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
             extra_features=extra_features,
             labels=labels,
         )
@@ -513,7 +453,6 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_length", type=int, default=384)
-    parser.add_argument("--response_max_length", type=int, default=128)
     parser.add_argument("--context_turns", type=int, default=16)
     parser.add_argument("--num_slices", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
@@ -547,15 +486,12 @@ def main() -> None:
     print(
         f"[INFO] model={args.model_name} use_channelmix={args.use_channelmix} "
         f"channelmix_layers={args.channelmix_layers} max_length={args.max_length} "
-        f"response_max_length={args.response_max_length} "
         f"context_turns={args.context_turns} batch_size={args.batch_size}"
     )
 
     rows = parse_nodes(nodes_csv)
     centrality, node_slice = load_centrality(centrality_dir, args.num_slices)
-    community_ratio = compute_louvain_feature(slices_txt_dir, node_slice, args.num_slices, args.seed)
-
-    split_samples = build_samples(rows, centrality, community_ratio, args.context_turns)
+    split_samples = build_samples(rows, centrality, args.context_turns)
     for split in ("train", "dev", "test"):
         print(f"[INFO] {split} samples={len(split_samples[split])}")
 
@@ -573,7 +509,7 @@ def main() -> None:
     model.to(device)
     print(f"[INFO] device={device}")
 
-    collator = Collator(tokenizer, args.max_length, args.response_max_length)
+    collator = Collator(tokenizer, args.max_length)
 
     train_dataset = TiageDataset(split_samples["train"])
     dev_dataset = TiageDataset(split_samples["dev"])
@@ -612,18 +548,14 @@ def main() -> None:
         total_loss = 0.0
 
         for batch in train_loader:
-            context_input_ids = batch["context_input_ids"].to(device)
-            context_attention_mask = batch["context_attention_mask"].to(device)
-            response_input_ids = batch["response_input_ids"].to(device)
-            response_attention_mask = batch["response_attention_mask"].to(device)
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
             extra_features = batch["extra_features"].to(device)
 
             loss, _ = model(
-                context_input_ids=context_input_ids,
-                context_attention_mask=context_attention_mask,
-                response_input_ids=response_input_ids,
-                response_attention_mask=response_attention_mask,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
                 extra_features=extra_features,
                 labels=labels,
                 class_weights=class_weights,
@@ -680,7 +612,7 @@ def main() -> None:
     save_csv(
         output_dir / "predictions.csv",
         train_rows + dev_rows + test_rows,
-        ["split", "dialog_id", "turn_id", "node_id", "label", "pred", "prob_1", "centrality", "community_ratio"],
+        ["split", "dialog_id", "turn_id", "node_id", "label", "pred", "prob_1", "centrality"],
     )
 
     print("[RESULT] Test metrics")
