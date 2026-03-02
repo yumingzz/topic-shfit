@@ -23,12 +23,37 @@ class Sample:
     text: str
     label: int
     centrality: float
+    sim_ctx_resp: float
+    sim_resp_last1: float
+    sim_resp_lastk_max: float
 
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def _tf_vector(text: str) -> Dict[str, float]:
+    vec: Dict[str, float] = {}
+    for tok in text.lower().split():
+        vec[tok] = vec.get(tok, 0.0) + 1.0
+    return vec
+
+
+def cosine_sim_text(a: str, b: str) -> float:
+    va = _tf_vector(a)
+    vb = _tf_vector(b)
+    if not va or not vb:
+        return 0.0
+    dot = 0.0
+    for k, v in va.items():
+        dot += v * vb.get(k, 0.0)
+    na = sum(v * v for v in va.values()) ** 0.5
+    nb = sum(v * v for v in vb.values()) ** 0.5
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / (na * nb)
 
 
 def parse_nodes(nodes_csv: Path) -> List[dict]:
@@ -136,6 +161,10 @@ def build_samples(
     rows: List[dict],
     centrality: Dict[int, float],
     context_turns: int,
+    use_sim_ctx_resp: bool = False,
+    use_sim_resp_last1: bool = False,
+    use_sim_resp_lastk_max: bool = False,
+    last_k: int = 3,
 ) -> Dict[str, List[Sample]]:
     by_dialog: Dict[Tuple[str, int], List[dict]] = {}
     for r in rows:
@@ -160,12 +189,33 @@ def build_samples(
                 ctx_parts.append(f"{h['text']} [CEN={h_c:.4f}]")
 
             cur_c = centrality.get(cur["node_id"], 0.0)
-
             context_text = " </s> ".join(ctx_parts) if ctx_parts else "<no_context>"
+            response_text = str(cur["text"])
+            sim_ctx_resp = cosine_sim_text(response_text, context_text) if use_sim_ctx_resp else 0.0
+            if i - 1 >= 0:
+                sim_resp_last1 = cosine_sim_text(response_text, str(turns[i - 1]["text"])) if use_sim_resp_last1 else 0.0
+            else:
+                sim_resp_last1 = 0.0
+            start = max(0, i - max(1, last_k))
+            lastk_texts = [str(turns[j]["text"]) for j in range(start, i)]
+            if lastk_texts and use_sim_resp_lastk_max:
+                sim_resp_lastk_max = max(cosine_sim_text(response_text, t) for t in lastk_texts)
+            else:
+                sim_resp_lastk_max = 0.0
+
+            sim_tags: List[str] = []
+            if use_sim_ctx_resp:
+                sim_tags.append(f"[SIM_CTX={sim_ctx_resp:.4f}]")
+            if use_sim_resp_last1:
+                sim_tags.append(f"[SIM_LAST1={sim_resp_last1:.4f}]")
+            if use_sim_resp_lastk_max:
+                sim_tags.append(f"[SIM_LASTK={sim_resp_lastk_max:.4f}]")
+            sim_tag_text = " " + " ".join(sim_tags) if sim_tags else ""
+
             text = (
                 f"task: topic shift detection\\n"
                 f"context: {context_text}\\n"
-                f"response: {cur['text']} [CEN={cur_c:.4f}]"
+                f"response: {response_text} [CEN={cur_c:.4f}]{sim_tag_text}"
             )
 
             sample = Sample(
@@ -176,6 +226,9 @@ def build_samples(
                 text=text,
                 label=label,
                 centrality=cur_c,
+                sim_ctx_resp=sim_ctx_resp,
+                sim_resp_last1=sim_resp_last1,
+                sim_resp_lastk_max=sim_resp_lastk_max,
             )
             if split in result:
                 result[split].append(sample)
@@ -195,9 +248,19 @@ class TiageDataset(Dataset):
 
 
 class Collator:
-    def __init__(self, tokenizer, max_length: int):
+    def __init__(
+        self,
+        tokenizer,
+        max_length: int,
+        use_sim_ctx_resp: bool = False,
+        use_sim_resp_last1: bool = False,
+        use_sim_resp_lastk_max: bool = False,
+    ):
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.use_sim_ctx_resp = use_sim_ctx_resp
+        self.use_sim_resp_last1 = use_sim_resp_last1
+        self.use_sim_resp_lastk_max = use_sim_resp_lastk_max
 
     def __call__(self, batch: List[Sample]) -> dict:
         texts = [x.text for x in batch]
@@ -209,7 +272,17 @@ class Collator:
             return_tensors="pt",
         )
         labels = torch.tensor([x.label for x in batch], dtype=torch.long)
-        feats = torch.tensor([[x.centrality] for x in batch], dtype=torch.float)
+        feat_rows: List[List[float]] = []
+        for x in batch:
+            row = [x.centrality]
+            if self.use_sim_ctx_resp:
+                row.append(x.sim_ctx_resp)
+            if self.use_sim_resp_last1:
+                row.append(x.sim_resp_last1)
+            if self.use_sim_resp_lastk_max:
+                row.append(x.sim_resp_lastk_max)
+            feat_rows.append(row)
+        feats = torch.tensor(feat_rows, dtype=torch.float)
 
         return {
             "input_ids": tok["input_ids"],
@@ -358,6 +431,9 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, thresho
                     "pred": p,
                     "prob_1": float(p1),
                     "centrality": float(m.centrality),
+                    "sim_ctx_resp": float(m.sim_ctx_resp),
+                    "sim_resp_last1": float(m.sim_resp_last1),
+                    "sim_resp_lastk_max": float(m.sim_resp_lastk_max),
                 }
             )
 
@@ -467,6 +543,10 @@ def main() -> None:
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_length", type=int, default=384)
     parser.add_argument("--context_turns", type=int, default=16)
+    parser.add_argument("--sim_last_k", type=int, default=3, help="k for sim_resp_lastk_max feature.")
+    parser.add_argument("--use_sim_ctx_resp", action="store_true", help="Use sim_ctx_resp as numeric/text feature.")
+    parser.add_argument("--use_sim_resp_last1", action="store_true", help="Use sim_resp_last1 as numeric/text feature.")
+    parser.add_argument("--use_sim_resp_lastk_max", action="store_true", help="Use sim_resp_lastk_max as numeric/text feature.")
     parser.add_argument("--num_slices", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--classifier_dropout", type=float, default=0.2)
@@ -500,12 +580,22 @@ def main() -> None:
     print(
         f"[INFO] model={args.model_name} use_channelmix={args.use_channelmix} "
         f"channelmix_layers={args.channelmix_layers} max_length={args.max_length} "
-        f"context_turns={args.context_turns} batch_size={args.batch_size}"
+        f"context_turns={args.context_turns} sim_last_k={args.sim_last_k} batch_size={args.batch_size} "
+        f"use_sim_ctx_resp={args.use_sim_ctx_resp} use_sim_resp_last1={args.use_sim_resp_last1} "
+        f"use_sim_resp_lastk_max={args.use_sim_resp_lastk_max}"
     )
 
     rows = parse_nodes(nodes_csv)
     centrality, node_slice = load_centrality(centrality_dir, args.num_slices)
-    split_samples = build_samples(rows, centrality, args.context_turns)
+    split_samples = build_samples(
+        rows,
+        centrality,
+        args.context_turns,
+        use_sim_ctx_resp=args.use_sim_ctx_resp,
+        use_sim_resp_last1=args.use_sim_resp_last1,
+        use_sim_resp_lastk_max=args.use_sim_resp_lastk_max,
+        last_k=args.sim_last_k,
+    )
     if args.no_zscore:
         print("[INFO] centrality_zscore=disabled")
     else:
@@ -515,6 +605,7 @@ def main() -> None:
         print(f"[INFO] {split} samples={len(split_samples[split])}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    num_extra_features = 1 + int(args.use_sim_ctx_resp) + int(args.use_sim_resp_last1) + int(args.use_sim_resp_lastk_max)
     model = T5ShiftClassifier(
         model_name=args.model_name,
         dropout=args.classifier_dropout,
@@ -522,13 +613,20 @@ def main() -> None:
         channelmix_layers=args.channelmix_layers,
         channelmix_hidden_mult=args.channelmix_hidden_mult,
         channelmix_dropout=args.channelmix_dropout,
+        num_extra_features=num_extra_features,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     print(f"[INFO] device={device}")
 
-    collator = Collator(tokenizer, args.max_length)
+    collator = Collator(
+        tokenizer,
+        args.max_length,
+        use_sim_ctx_resp=args.use_sim_ctx_resp,
+        use_sim_resp_last1=args.use_sim_resp_last1,
+        use_sim_resp_lastk_max=args.use_sim_resp_lastk_max,
+    )
 
     train_dataset = TiageDataset(split_samples["train"])
     dev_dataset = TiageDataset(split_samples["dev"])
@@ -631,7 +729,19 @@ def main() -> None:
     save_csv(
         output_dir / "predictions.csv",
         train_rows + dev_rows + test_rows,
-        ["split", "dialog_id", "turn_id", "node_id", "label", "pred", "prob_1", "centrality"],
+        [
+            "split",
+            "dialog_id",
+            "turn_id",
+            "node_id",
+            "label",
+            "pred",
+            "prob_1",
+            "centrality",
+            "sim_ctx_resp",
+            "sim_resp_last1",
+            "sim_resp_lastk_max",
+        ],
     )
 
     print("[RESULT] Test metrics")
