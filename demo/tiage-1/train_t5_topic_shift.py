@@ -423,6 +423,19 @@ def compute_class_weights(train_samples: List[Sample]) -> torch.Tensor:
     return torch.tensor([w0, w1], dtype=torch.float)
 
 
+def apply_train_zscore(split_samples: Dict[str, List[Sample]], eps: float = 1e-8) -> Tuple[float, float]:
+    train_vals = [s.centrality for s in split_samples.get("train", [])]
+    if not train_vals:
+        return 0.0, 1.0
+    mean = sum(train_vals) / float(len(train_vals))
+    var = sum((x - mean) ** 2 for x in train_vals) / float(len(train_vals))
+    std = (var + eps) ** 0.5
+    for split in ("train", "dev", "test"):
+        for s in split_samples.get(split, []):
+            s.centrality = (s.centrality - mean) / std
+    return mean, std
+
+
 def build_oversample_sampler(train_samples: List[Sample]) -> WeightedRandomSampler:
     # Inverse-frequency sampling to oversample label=1 in each epoch.
     count0 = sum(1 for s in train_samples if s.label == 0)
@@ -456,13 +469,14 @@ def main() -> None:
     parser.add_argument("--context_turns", type=int, default=16)
     parser.add_argument("--num_slices", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--classifier_dropout", type=float, default=0.1)
+    parser.add_argument("--classifier_dropout", type=float, default=0.2)
     parser.add_argument("--use_channelmix", action="store_true", help="Enable RWKV ChannelMix blocks after T5 encoder.")
     parser.add_argument("--channelmix_layers", type=int, default=1)
     parser.add_argument("--channelmix_hidden_mult", type=int, default=4)
     parser.add_argument("--channelmix_dropout", type=float, default=0.1)
     parser.add_argument("--no_class_weights", action="store_true", help="Disable class-weighted cross-entropy.")
     parser.add_argument("--no_oversample_train", action="store_true", help="Disable training oversampling for label=1.")
+    parser.add_argument("--no_zscore", action="store_true", help="Disable train-based z-score normalization for centrality.")
     parser.add_argument("--thr_min", type=float, default=0.30)
     parser.add_argument("--thr_max", type=float, default=0.70)
     parser.add_argument("--thr_step", type=float, default=0.01)
@@ -492,6 +506,11 @@ def main() -> None:
     rows = parse_nodes(nodes_csv)
     centrality, node_slice = load_centrality(centrality_dir, args.num_slices)
     split_samples = build_samples(rows, centrality, args.context_turns)
+    if args.no_zscore:
+        print("[INFO] centrality_zscore=disabled")
+    else:
+        z_mean, z_std = apply_train_zscore(split_samples)
+        print(f"[INFO] centrality_zscore_train_mean={z_mean:.6f} std={z_std:.6f}")
     for split in ("train", "dev", "test"):
         print(f"[INFO] {split} samples={len(split_samples[split])}")
 
