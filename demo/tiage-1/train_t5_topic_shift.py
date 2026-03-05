@@ -25,6 +25,7 @@ class Sample:
     response_text: str
     label: int
     centrality: float
+    community_ratio: float
     sim_ctx_resp: float
     sim_resp_last1: float
     sim_resp_lastk_max: float
@@ -162,6 +163,7 @@ def compute_louvain_feature(
 def build_samples(
     rows: List[dict],
     centrality: Dict[int, float],
+    community_ratio: Dict[int, float],
     context_turns: int,
     use_sim_ctx_resp: bool = False,
     use_sim_resp_last1: bool = False,
@@ -188,9 +190,11 @@ def build_samples(
             ctx_parts: List[str] = []
             for h in hist:
                 h_c = centrality.get(h["node_id"], 0.0)
-                ctx_parts.append(f"{h['text']} [CEN={h_c:.4f}]")
+                h_m = community_ratio.get(h["node_id"], 0.0)
+                ctx_parts.append(f"{h['text']} [CEN={h_c:.4f}] [COM={h_m:.4f}]")
 
             cur_c = centrality.get(cur["node_id"], 0.0)
+            cur_m = community_ratio.get(cur["node_id"], 0.0)
             context_text = " </s> ".join(ctx_parts) if ctx_parts else "<no_context>"
             response_text = str(cur["text"])
             sim_ctx_resp = cosine_sim_text(response_text, context_text) if use_sim_ctx_resp else 0.0
@@ -217,7 +221,7 @@ def build_samples(
             text = (
                 f"task: topic shift detection\\n"
                 f"context: {context_text}\\n"
-                f"response: {response_text} [CEN={cur_c:.4f}]{sim_tag_text}"
+                f"response: {response_text} [CEN={cur_c:.4f}] [COM={cur_m:.4f}]{sim_tag_text}"
             )
 
             sample = Sample(
@@ -230,6 +234,7 @@ def build_samples(
                 response_text=response_text,
                 label=label,
                 centrality=cur_c,
+                community_ratio=cur_m,
                 sim_ctx_resp=sim_ctx_resp,
                 sim_resp_last1=sim_resp_last1,
                 sim_resp_lastk_max=sim_resp_lastk_max,
@@ -298,7 +303,7 @@ class Collator:
         labels = torch.tensor([x.label for x in batch], dtype=torch.long)
         feat_rows: List[List[float]] = []
         for x in batch:
-            row = [x.centrality]
+            row = [x.centrality, x.community_ratio]
             if self.use_sim_ctx_resp:
                 row.append(x.sim_ctx_resp)
             if self.use_sim_resp_last1:
@@ -491,6 +496,7 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, thresho
                     "pred": p,
                     "prob_1": float(p1),
                     "centrality": float(m.centrality),
+                    "community_ratio": float(m.community_ratio),
                     "sim_ctx_resp": float(m.sim_ctx_resp),
                     "sim_resp_last1": float(m.sim_resp_last1),
                     "sim_resp_lastk_max": float(m.sim_resp_lastk_max),
@@ -628,9 +634,8 @@ def main() -> None:
     parser.add_argument("--no_class_weights", action="store_true", help="Disable class-weighted cross-entropy.")
     parser.add_argument("--no_oversample_train", action="store_true", help="Disable training oversampling for label=1.")
     parser.add_argument("--no_zscore", action="store_true", help="Disable train-based z-score normalization for centrality.")
-    parser.add_argument("--thr_min", type=float, default=0.30)
-    parser.add_argument("--thr_max", type=float, default=0.70)
-    parser.add_argument("--thr_step", type=float, default=0.01)
+    parser.add_argument("--fixed_threshold", type=float, default=0.5, help="Fixed decision threshold for train/dev/test evaluation.")
+    parser.add_argument("--best_model_select", type=str, default="prf_sum", choices=["macro_f1", "prf_sum"])
     args = parser.parse_args()
     if args.use_channelmix and args.channelmix_layers < 1:
         raise ValueError("--channelmix_layers must be >= 1 when --use_channelmix is enabled.")
@@ -655,14 +660,23 @@ def main() -> None:
         f"context_max_length={args.context_max_length} response_max_length={args.response_max_length} "
         f"context_turns={args.context_turns} sim_last_k={args.sim_last_k} batch_size={args.batch_size} "
         f"use_sim_ctx_resp={args.use_sim_ctx_resp} use_sim_resp_last1={args.use_sim_resp_last1} "
-        f"use_sim_resp_lastk_max={args.use_sim_resp_lastk_max}"
+        f"use_sim_resp_lastk_max={args.use_sim_resp_lastk_max} fixed_threshold={args.fixed_threshold} "
+        f"best_model_select={args.best_model_select}"
     )
 
     rows = parse_nodes(nodes_csv)
     centrality, node_slice = load_centrality(centrality_dir, args.num_slices)
+    community_ratio, _bridge_ratio = compute_louvain_feature(
+        slices_txt_dir=slices_txt_dir,
+        node_slice=node_slice,
+        num_slices=args.num_slices,
+        seed=args.seed,
+    )
+
     split_samples = build_samples(
         rows,
         centrality,
+        community_ratio,
         args.context_turns,
         use_sim_ctx_resp=args.use_sim_ctx_resp,
         use_sim_resp_last1=args.use_sim_resp_last1,
@@ -678,7 +692,7 @@ def main() -> None:
         print(f"[INFO] {split} samples={len(split_samples[split])}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    num_extra_features = 1 + int(args.use_sim_ctx_resp) + int(args.use_sim_resp_last1) + int(args.use_sim_resp_lastk_max)
+    num_extra_features = 2 + int(args.use_sim_ctx_resp) + int(args.use_sim_resp_last1) + int(args.use_sim_resp_lastk_max)
     model = T5ShiftClassifier(
         model_name=args.model_name,
         dropout=args.classifier_dropout,
@@ -733,6 +747,7 @@ def main() -> None:
     )
 
     best_dev = -1.0
+    best_score = -1.0
     best_epoch = 0
     best_path = output_dir / "best_model.pt"
 
@@ -769,7 +784,7 @@ def main() -> None:
 
             total_loss += loss.item()
 
-        dev_metrics, _ = evaluate(model, dev_loader, device, threshold=0.5)
+        dev_metrics, _ = evaluate(model, dev_loader, device, threshold=args.fixed_threshold)
         avg_loss = total_loss / max(1, len(train_loader))
         print(
             f"[EPOCH {epoch}] train_loss={avg_loss:.4f} "
@@ -777,32 +792,30 @@ def main() -> None:
             f"dev_MacroF1={dev_metrics['macro_f1']:.4f}"
         )
 
-        if dev_metrics["macro_f1"] > best_dev:
+        if args.best_model_select == "prf_sum":
+            current_score = dev_metrics["precision"] + dev_metrics["recall"] + dev_metrics["macro_f1"]
+        else:
+            current_score = dev_metrics["macro_f1"]
+
+        if current_score > best_score:
+            best_score = current_score
             best_dev = dev_metrics["macro_f1"]
             best_epoch = epoch
             torch.save(model.state_dict(), best_path)
 
-    print(f"[INFO] best dev Macro-F1={best_dev:.4f} at epoch={best_epoch}")
+    print(f"[INFO] best dev Macro-F1={best_dev:.4f} at epoch={best_epoch} (select={args.best_model_select}, score={best_score:.4f})")
 
     model.load_state_dict(torch.load(best_path, map_location=device))
-    best_threshold = find_best_threshold(
-        model=model,
-        loader=dev_loader,
-        device=device,
-        min_thr=args.thr_min,
-        max_thr=args.thr_max,
-        step=args.thr_step,
-    )
-    print(f"[INFO] best_threshold_on_dev={best_threshold:.2f}")
+    print(f"[INFO] fixed_threshold={args.fixed_threshold:.2f}")
 
-    train_metrics, train_rows = evaluate(model, train_eval_loader, device, threshold=best_threshold)
-    dev_metrics, dev_rows = evaluate(model, dev_loader, device, threshold=best_threshold)
-    test_metrics, test_rows = evaluate(model, test_loader, device, threshold=best_threshold)
+    train_metrics, train_rows = evaluate(model, train_eval_loader, device, threshold=args.fixed_threshold)
+    dev_metrics, dev_rows = evaluate(model, dev_loader, device, threshold=args.fixed_threshold)
+    test_metrics, test_rows = evaluate(model, test_loader, device, threshold=args.fixed_threshold)
 
     metrics_rows = [
-        {"split": "train", "best_epoch": best_epoch, "best_threshold": best_threshold, "model_name": args.model_name, "use_channelmix": int(args.use_channelmix), **train_metrics},
-        {"split": "dev", "best_epoch": best_epoch, "best_threshold": best_threshold, "model_name": args.model_name, "use_channelmix": int(args.use_channelmix), **dev_metrics},
-        {"split": "test", "best_epoch": best_epoch, "best_threshold": best_threshold, "model_name": args.model_name, "use_channelmix": int(args.use_channelmix), **test_metrics},
+        {"split": "train", "best_epoch": best_epoch, "best_threshold": args.fixed_threshold, "model_name": args.model_name, "use_channelmix": int(args.use_channelmix), **train_metrics},
+        {"split": "dev", "best_epoch": best_epoch, "best_threshold": args.fixed_threshold, "model_name": args.model_name, "use_channelmix": int(args.use_channelmix), **dev_metrics},
+        {"split": "test", "best_epoch": best_epoch, "best_threshold": args.fixed_threshold, "model_name": args.model_name, "use_channelmix": int(args.use_channelmix), **test_metrics},
     ]
 
     save_csv(
@@ -822,6 +835,7 @@ def main() -> None:
             "pred",
             "prob_1",
             "centrality",
+            "community_ratio",
             "sim_ctx_resp",
             "sim_resp_last1",
             "sim_resp_lastk_max",
