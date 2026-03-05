@@ -21,6 +21,8 @@ class Sample:
     turn_id: int
     node_id: int
     text: str
+    context_text: str
+    response_text: str
     label: int
     centrality: float
     sim_ctx_resp: float
@@ -224,6 +226,8 @@ def build_samples(
                 turn_id=cur["turn_id"],
                 node_id=cur["node_id"],
                 text=text,
+                context_text=context_text,
+                response_text=response_text,
                 label=label,
                 centrality=cur_c,
                 sim_ctx_resp=sim_ctx_resp,
@@ -252,12 +256,16 @@ class Collator:
         self,
         tokenizer,
         max_length: int,
+        context_max_length: int,
+        response_max_length: int,
         use_sim_ctx_resp: bool = False,
         use_sim_resp_last1: bool = False,
         use_sim_resp_lastk_max: bool = False,
     ):
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.context_max_length = context_max_length
+        self.response_max_length = response_max_length
         self.use_sim_ctx_resp = use_sim_ctx_resp
         self.use_sim_resp_last1 = use_sim_resp_last1
         self.use_sim_resp_lastk_max = use_sim_resp_lastk_max
@@ -269,6 +277,22 @@ class Collator:
             padding=True,
             truncation=True,
             max_length=self.max_length,
+            return_tensors="pt",
+        )
+        context_texts = [x.context_text for x in batch]
+        response_texts = [x.response_text for x in batch]
+        tok_ctx = self.tokenizer(
+            context_texts,
+            padding=True,
+            truncation=True,
+            max_length=self.context_max_length,
+            return_tensors="pt",
+        )
+        tok_rsp = self.tokenizer(
+            response_texts,
+            padding=True,
+            truncation=True,
+            max_length=self.response_max_length,
             return_tensors="pt",
         )
         labels = torch.tensor([x.label for x in batch], dtype=torch.long)
@@ -287,6 +311,10 @@ class Collator:
         return {
             "input_ids": tok["input_ids"],
             "attention_mask": tok["attention_mask"],
+            "context_input_ids": tok_ctx["input_ids"],
+            "context_attention_mask": tok_ctx["attention_mask"],
+            "response_input_ids": tok_rsp["input_ids"],
+            "response_attention_mask": tok_rsp["attention_mask"],
             "labels": labels,
             "extra_features": feats,
             "meta": batch,
@@ -318,6 +346,7 @@ class T5ShiftClassifier(nn.Module):
         model_name: str,
         dropout: float = 0.1,
         use_channelmix: bool = False,
+        use_interaction_head: bool = True,
         channelmix_layers: int = 1,
         channelmix_hidden_mult: int = 4,
         channelmix_dropout: float = 0.1,
@@ -327,6 +356,7 @@ class T5ShiftClassifier(nn.Module):
         self.encoder = T5EncoderModel.from_pretrained(model_name)
         hidden = self.encoder.config.d_model
         self.use_channelmix = use_channelmix
+        self.use_interaction_head = use_interaction_head
         self.channelmix_stack = nn.ModuleList(
             [
                 RWKVChannelMix(
@@ -338,21 +368,20 @@ class T5ShiftClassifier(nn.Module):
             ]
         )
         self.feature_norm = nn.LayerNorm(num_extra_features)
+        self.interaction_proj = nn.Sequential(
+            nn.Linear(hidden * 2, hidden),
+            nn.Tanh(),
+            nn.Dropout(dropout),
+        )
+        classifier_in = hidden + num_extra_features + (hidden if use_interaction_head else 0)
         self.classifier = nn.Sequential(
-            nn.Linear(hidden + num_extra_features, hidden),
+            nn.Linear(classifier_in, hidden),
             nn.Tanh(),
             nn.Dropout(dropout),
             nn.Linear(hidden, 2),
         )
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        extra_features: torch.Tensor,
-        labels: torch.Tensor = None,
-        class_weights: torch.Tensor = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _encode_pooled(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
         hs = out.last_hidden_state
         if self.use_channelmix:
@@ -360,8 +389,31 @@ class T5ShiftClassifier(nn.Module):
                 hs = block(hs)
         mask = attention_mask.unsqueeze(-1).float()
         pooled = (hs * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
+        return pooled
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        extra_features: torch.Tensor,
+        context_input_ids: torch.Tensor = None,
+        context_attention_mask: torch.Tensor = None,
+        response_input_ids: torch.Tensor = None,
+        response_attention_mask: torch.Tensor = None,
+        labels: torch.Tensor = None,
+        class_weights: torch.Tensor = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        pooled = self._encode_pooled(input_ids, attention_mask)
         feats = self.feature_norm(extra_features)
-        logits = self.classifier(torch.cat([pooled, feats], dim=-1))
+        parts = [pooled]
+        if self.use_interaction_head and context_input_ids is not None and response_input_ids is not None:
+            h_ctx = self._encode_pooled(context_input_ids, context_attention_mask)
+            h_rsp = self._encode_pooled(response_input_ids, response_attention_mask)
+            interaction = torch.cat([torch.abs(h_ctx - h_rsp), h_ctx * h_rsp], dim=-1)
+            interaction = self.interaction_proj(interaction)
+            parts.append(interaction)
+        parts.append(feats)
+        logits = self.classifier(torch.cat(parts, dim=-1))
 
         loss = None
         if labels is not None:
@@ -403,6 +455,10 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, thresho
     for batch in loader:
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
+        context_input_ids = batch["context_input_ids"].to(device)
+        context_attention_mask = batch["context_attention_mask"].to(device)
+        response_input_ids = batch["response_input_ids"].to(device)
+        response_attention_mask = batch["response_attention_mask"].to(device)
         labels = batch["labels"].to(device)
         extra_features = batch["extra_features"].to(device)
 
@@ -410,6 +466,10 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, thresho
             input_ids=input_ids,
             attention_mask=attention_mask,
             extra_features=extra_features,
+            context_input_ids=context_input_ids,
+            context_attention_mask=context_attention_mask,
+            response_input_ids=response_input_ids,
+            response_attention_mask=response_attention_mask,
             labels=labels,
         )
 
@@ -464,12 +524,20 @@ def find_best_threshold(
     for batch in loader:
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
+        context_input_ids = batch["context_input_ids"].to(device)
+        context_attention_mask = batch["context_attention_mask"].to(device)
+        response_input_ids = batch["response_input_ids"].to(device)
+        response_attention_mask = batch["response_attention_mask"].to(device)
         labels = batch["labels"].to(device)
         extra_features = batch["extra_features"].to(device)
         _, logits = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             extra_features=extra_features,
+            context_input_ids=context_input_ids,
+            context_attention_mask=context_attention_mask,
+            response_input_ids=response_input_ids,
+            response_attention_mask=response_attention_mask,
             labels=labels,
         )
         probs = torch.softmax(logits, dim=-1)[:, 1]
@@ -542,6 +610,8 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_length", type=int, default=384)
+    parser.add_argument("--context_max_length", type=int, default=320)
+    parser.add_argument("--response_max_length", type=int, default=96)
     parser.add_argument("--context_turns", type=int, default=16)
     parser.add_argument("--sim_last_k", type=int, default=3, help="k for sim_resp_lastk_max feature.")
     parser.add_argument("--use_sim_ctx_resp", action="store_true", help="Use sim_ctx_resp as numeric/text feature.")
@@ -551,6 +621,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--classifier_dropout", type=float, default=0.2)
     parser.add_argument("--use_channelmix", action="store_true", help="Enable RWKV ChannelMix blocks after T5 encoder.")
+    parser.add_argument("--use_interaction_head", action="store_true", help="Enable minimal interaction head with ctx/resp interaction.")
     parser.add_argument("--channelmix_layers", type=int, default=1)
     parser.add_argument("--channelmix_hidden_mult", type=int, default=4)
     parser.add_argument("--channelmix_dropout", type=float, default=0.1)
@@ -579,7 +650,9 @@ def main() -> None:
     print(f"[INFO] output_dir={output_dir}")
     print(
         f"[INFO] model={args.model_name} use_channelmix={args.use_channelmix} "
+        f"use_interaction_head={args.use_interaction_head} "
         f"channelmix_layers={args.channelmix_layers} max_length={args.max_length} "
+        f"context_max_length={args.context_max_length} response_max_length={args.response_max_length} "
         f"context_turns={args.context_turns} sim_last_k={args.sim_last_k} batch_size={args.batch_size} "
         f"use_sim_ctx_resp={args.use_sim_ctx_resp} use_sim_resp_last1={args.use_sim_resp_last1} "
         f"use_sim_resp_lastk_max={args.use_sim_resp_lastk_max}"
@@ -610,6 +683,7 @@ def main() -> None:
         model_name=args.model_name,
         dropout=args.classifier_dropout,
         use_channelmix=args.use_channelmix,
+        use_interaction_head=args.use_interaction_head,
         channelmix_layers=args.channelmix_layers,
         channelmix_hidden_mult=args.channelmix_hidden_mult,
         channelmix_dropout=args.channelmix_dropout,
@@ -623,6 +697,8 @@ def main() -> None:
     collator = Collator(
         tokenizer,
         args.max_length,
+        args.context_max_length,
+        args.response_max_length,
         use_sim_ctx_resp=args.use_sim_ctx_resp,
         use_sim_resp_last1=args.use_sim_resp_last1,
         use_sim_resp_lastk_max=args.use_sim_resp_lastk_max,
@@ -667,6 +743,10 @@ def main() -> None:
         for batch in train_loader:
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
+            context_input_ids = batch["context_input_ids"].to(device)
+            context_attention_mask = batch["context_attention_mask"].to(device)
+            response_input_ids = batch["response_input_ids"].to(device)
+            response_attention_mask = batch["response_attention_mask"].to(device)
             labels = batch["labels"].to(device)
             extra_features = batch["extra_features"].to(device)
 
@@ -674,6 +754,10 @@ def main() -> None:
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 extra_features=extra_features,
+                context_input_ids=context_input_ids,
+                context_attention_mask=context_attention_mask,
+                response_input_ids=response_input_ids,
+                response_attention_mask=response_attention_mask,
                 labels=labels,
                 class_weights=class_weights,
             )
