@@ -12,6 +12,19 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, T5EncoderModel, get_linear_schedule_with_warmup
 
 
+class FocalLoss(nn.Module):
+    def __init__(self, gamma: float = 2.0, weight: torch.Tensor = None):
+        super().__init__()
+        self.gamma = gamma
+        self.weight = weight
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce_loss = F.cross_entropy(logits, targets, weight=self.weight, reduction="none")
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        return focal_loss.mean()
+
+
 @dataclass
 class Sample:
     split: str
@@ -178,12 +191,17 @@ class T5Baseline(nn.Module):
         )
         self.attn_pool = nn.Linear(hidden, 1)
         self.feature_norm = nn.LayerNorm(1)
+        self.feature_gate = nn.Sequential(
+            nn.Linear(1, hidden),
+            nn.Sigmoid(),
+        )
         self.classifier = nn.Sequential(
             nn.Linear(hidden + 1, hidden),
             nn.Tanh(),
             nn.Dropout(dropout),
             nn.Linear(hidden, 2),
         )
+        self.loss_fn = FocalLoss(gamma=2.0)
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, extra_features: torch.Tensor, labels: torch.Tensor = None):
         out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
@@ -195,10 +213,12 @@ class T5Baseline(nn.Module):
         attn_weight = torch.softmax(attn_logits, dim=-1).unsqueeze(-1)
         pooled = (hs * attn_weight).sum(dim=1)
         feats = self.feature_norm(extra_features)
-        logits = self.classifier(torch.cat([pooled, feats], dim=-1))
+        g = self.feature_gate(feats)
+        pooled_gated = pooled * (1.0 + g)
+        logits = self.classifier(torch.cat([pooled_gated, feats], dim=-1))
         loss = None
         if labels is not None:
-            loss = F.cross_entropy(logits, labels)
+            loss = self.loss_fn(logits, labels)
         return loss, logits
 
 
