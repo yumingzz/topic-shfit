@@ -254,34 +254,6 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, thresho
     return {"precision": precision, "recall": recall, "macro_f1": macro_f1, "accuracy": acc, "size": len(y_true)}, pred_rows
 
 
-@torch.no_grad()
-def find_best_threshold(model: nn.Module, loader: DataLoader, device: torch.device, min_thr: float, max_thr: float, step: float) -> float:
-    model.eval()
-    y_true: List[int] = []
-    prob_1: List[float] = []
-    for batch in loader:
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels = batch["labels"].to(device)
-        extra_features = batch["extra_features"].to(device)
-        _, logits = model(input_ids, attention_mask, extra_features, labels)
-        probs = torch.softmax(logits, dim=-1)[:, 1]
-        y_true.extend(labels.cpu().tolist())
-        prob_1.extend(probs.cpu().tolist())
-
-    best_thr = 0.5
-    best_f1 = -1.0
-    thr = min_thr
-    while thr <= max_thr + 1e-12:
-        y_pred = [1 if p >= thr else 0 for p in prob_1]
-        _, _, macro_f1 = precision_recall_macro_f1(y_true, y_pred)
-        if macro_f1 > best_f1:
-            best_f1 = macro_f1
-            best_thr = thr
-        thr += step
-    return float(best_thr)
-
-
 def save_csv(path: Path, rows: List[dict], fieldnames: List[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as f:
@@ -308,9 +280,7 @@ def main() -> None:
     parser.add_argument("--channelmix_layers", type=int, default=1)
     parser.add_argument("--channelmix_hidden_mult", type=int, default=4)
     parser.add_argument("--channelmix_dropout", type=float, default=0.1)
-    parser.add_argument("--thr_min", type=float, default=0.30)
-    parser.add_argument("--thr_max", type=float, default=0.70)
-    parser.add_argument("--thr_step", type=float, default=0.01)
+    parser.add_argument("--fixed_threshold", type=float, default=0.5)
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -359,6 +329,7 @@ def main() -> None:
     )
 
     best_dev = -1.0
+    best_score = -1.0
     best_epoch = 0
     best_path = output_dir / "best_model.pt"
     for epoch in range(1, args.epochs + 1):
@@ -377,32 +348,33 @@ def main() -> None:
             scheduler.step()
             total_loss += loss.item()
 
-        dev_metrics, _ = evaluate(model, dev_loader, device, threshold=0.5)
+        dev_metrics, _ = evaluate(model, dev_loader, device, threshold=args.fixed_threshold)
         avg_loss = total_loss / max(1, len(train_loader))
         print(
             f"[EPOCH {epoch}] train_loss={avg_loss:.4f} "
             f"dev_P={dev_metrics['precision']:.4f} dev_R={dev_metrics['recall']:.4f} "
             f"dev_MacroF1={dev_metrics['macro_f1']:.4f}"
         )
-        if dev_metrics["macro_f1"] > best_dev:
+        current_score = dev_metrics["precision"] + dev_metrics["recall"] + dev_metrics["macro_f1"]
+        if current_score > best_score:
+            best_score = current_score
             best_dev = dev_metrics["macro_f1"]
             best_epoch = epoch
             torch.save(model.state_dict(), best_path)
 
-    print(f"[INFO] best dev Macro-F1={best_dev:.4f} at epoch={best_epoch}")
+    print(f"[INFO] best dev Macro-F1={best_dev:.4f} at epoch={best_epoch} (prf_sum={best_score:.4f})")
 
     model.load_state_dict(torch.load(best_path, map_location=device))
-    best_threshold = find_best_threshold(model, dev_loader, device, args.thr_min, args.thr_max, args.thr_step)
-    print(f"[INFO] best_threshold_on_dev={best_threshold:.2f}")
+    print(f"[INFO] fixed_threshold={args.fixed_threshold:.2f}")
 
-    train_metrics, train_rows = evaluate(model, train_eval_loader, device, threshold=best_threshold)
-    dev_metrics, dev_rows = evaluate(model, dev_loader, device, threshold=best_threshold)
-    test_metrics, test_rows = evaluate(model, test_loader, device, threshold=best_threshold)
+    train_metrics, train_rows = evaluate(model, train_eval_loader, device, threshold=args.fixed_threshold)
+    dev_metrics, dev_rows = evaluate(model, dev_loader, device, threshold=args.fixed_threshold)
+    test_metrics, test_rows = evaluate(model, test_loader, device, threshold=args.fixed_threshold)
 
     metrics_rows = [
-        {"split": "train", "best_epoch": best_epoch, "best_threshold": best_threshold, "model_name": args.model_name, "use_channelmix": 1, **train_metrics},
-        {"split": "dev", "best_epoch": best_epoch, "best_threshold": best_threshold, "model_name": args.model_name, "use_channelmix": 1, **dev_metrics},
-        {"split": "test", "best_epoch": best_epoch, "best_threshold": best_threshold, "model_name": args.model_name, "use_channelmix": 1, **test_metrics},
+        {"split": "train", "best_epoch": best_epoch, "best_threshold": args.fixed_threshold, "model_name": args.model_name, "use_channelmix": 1, **train_metrics},
+        {"split": "dev", "best_epoch": best_epoch, "best_threshold": args.fixed_threshold, "model_name": args.model_name, "use_channelmix": 1, **dev_metrics},
+        {"split": "test", "best_epoch": best_epoch, "best_threshold": args.fixed_threshold, "model_name": args.model_name, "use_channelmix": 1, **test_metrics},
     ]
     save_csv(
         output_dir / "metrics.csv",
