@@ -243,7 +243,8 @@ class T5Baseline(nn.Module):
         self.channelmix_stack = nn.ModuleList(
             [RWKVChannelMix(hidden, hidden_mult=channelmix_hidden_mult, dropout=channelmix_dropout) for _ in range(max(0, channelmix_layers))]
         )
-        self.attn_pool = nn.Linear(hidden, 1)
+        self.attn_value = nn.Linear(hidden, 1)
+        self.attn_gate = nn.Linear(hidden, 1)
         self.feature_norm = nn.LayerNorm(2)
         self.feature_gate = nn.Sequential(
             nn.Linear(2, hidden),
@@ -262,7 +263,9 @@ class T5Baseline(nn.Module):
         hs = out.last_hidden_state
         for block in self.channelmix_stack:
             hs = block(hs)
-        attn_logits = self.attn_pool(hs).squeeze(-1)
+        attn_val = self.attn_value(hs).squeeze(-1)
+        attn_g = torch.sigmoid(self.attn_gate(hs).squeeze(-1))
+        attn_logits = attn_val * attn_g
         attn_logits = attn_logits.masked_fill(attention_mask == 0, -1e9)
         attn_weight = torch.softmax(attn_logits, dim=-1).unsqueeze(-1)
         pooled = (hs * attn_weight).sum(dim=1)
