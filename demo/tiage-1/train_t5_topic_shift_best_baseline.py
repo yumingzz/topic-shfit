@@ -5,9 +5,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sentence_transformers import SentenceTransformer
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, T5EncoderModel, get_linear_schedule_with_warmup
 
@@ -34,6 +36,7 @@ class Sample:
     text: str
     label: int
     centrality: float
+    sim_resp_last1: float
 
 
 def set_seed(seed: int) -> None:
@@ -76,7 +79,57 @@ def load_centrality(centrality_dir: Path, num_slices: int) -> Dict[int, float]:
     return centrality
 
 
-def build_samples(rows: List[dict], centrality: Dict[int, float], context_turns: int) -> Dict[str, List[Sample]]:
+def load_or_build_similarity_cache(
+    rows: List[dict],
+    cache_csv: Path,
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+) -> Dict[int, float]:
+    if cache_csv.exists():
+        sim_map: Dict[int, float] = {}
+        with cache_csv.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for r in reader:
+                sim_map[int(r["node_id"])] = float(r["sim_resp_last1"])
+        return sim_map
+
+    by_dialog: Dict[Tuple[str, int], List[dict]] = {}
+    for r in rows:
+        by_dialog.setdefault((r["split"], r["dialog_id"]), []).append(r)
+
+    # Encode each node text once, then compute adjacent-turn cosine by node_id.
+    texts = [str(r["text"]) for r in rows]
+    node_ids = [int(r["node_id"]) for r in rows]
+    model = SentenceTransformer(model_name)
+    emb = model.encode(texts, batch_size=64, normalize_embeddings=True, show_progress_bar=True)
+    emb_by_node = {nid: emb[i] for i, nid in enumerate(node_ids)}
+
+    sim_map: Dict[int, float] = {}
+    for _k, turns in by_dialog.items():
+        turns = sorted(turns, key=lambda x: x["turn_id"])
+        for i, cur in enumerate(turns):
+            cur_id = int(cur["node_id"])
+            if i == 0:
+                sim_map[cur_id] = 0.0
+            else:
+                prev_id = int(turns[i - 1]["node_id"])
+                sim = float(np.dot(emb_by_node[cur_id], emb_by_node[prev_id]))
+                sim_map[cur_id] = sim
+
+    cache_csv.parent.mkdir(parents=True, exist_ok=True)
+    with cache_csv.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["node_id", "sim_resp_last1"])
+        writer.writeheader()
+        for nid in sorted(sim_map):
+            writer.writerow({"node_id": nid, "sim_resp_last1": sim_map[nid]})
+    return sim_map
+
+
+def build_samples(
+    rows: List[dict],
+    centrality: Dict[int, float],
+    sim_resp_last1_map: Dict[int, float],
+    context_turns: int,
+) -> Dict[str, List[Sample]]:
     by_dialog: Dict[Tuple[str, int], List[dict]] = {}
     for r in rows:
         by_dialog.setdefault((r["split"], r["dialog_id"]), []).append(r)
@@ -114,6 +167,7 @@ def build_samples(rows: List[dict], centrality: Dict[int, float], context_turns:
                 text=text,
                 label=label,
                 centrality=cur_c,
+                sim_resp_last1=sim_resp_last1_map.get(int(cur["node_id"]), 0.0),
             )
             if split in result:
                 result[split].append(sample)
@@ -146,7 +200,7 @@ class Collator:
             return_tensors="pt",
         )
         labels = torch.tensor([x.label for x in batch], dtype=torch.long)
-        feats = torch.tensor([[x.centrality] for x in batch], dtype=torch.float)
+        feats = torch.tensor([[x.centrality, x.sim_resp_last1] for x in batch], dtype=torch.float)
         return {
             "input_ids": tok["input_ids"],
             "attention_mask": tok["attention_mask"],
@@ -190,18 +244,18 @@ class T5Baseline(nn.Module):
             [RWKVChannelMix(hidden, hidden_mult=channelmix_hidden_mult, dropout=channelmix_dropout) for _ in range(max(0, channelmix_layers))]
         )
         self.attn_pool = nn.Linear(hidden, 1)
-        self.feature_norm = nn.LayerNorm(1)
+        self.feature_norm = nn.LayerNorm(2)
         self.feature_gate = nn.Sequential(
-            nn.Linear(1, hidden),
+            nn.Linear(2, hidden),
             nn.Sigmoid(),
         )
         self.classifier = nn.Sequential(
-            nn.Linear(hidden + 1, hidden),
+            nn.Linear(hidden + 2, hidden),
             nn.Tanh(),
             nn.Dropout(dropout),
             nn.Linear(hidden, 2),
         )
-        self.loss_fn = FocalLoss(gamma=2.0)
+        self.loss_fn = FocalLoss(gamma=1.5)
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, extra_features: torch.Tensor, labels: torch.Tensor = None):
         out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
@@ -269,12 +323,54 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, thresho
                     "pred": p,
                     "prob_1": float(p1),
                     "centrality": float(m.centrality),
+                    "sim_resp_last1": float(m.sim_resp_last1),
                 }
             )
 
     precision, recall, macro_f1 = precision_recall_macro_f1(y_true, y_pred)
     acc = sum(1 for t, p in zip(y_true, y_pred) if t == p) / len(y_true)
     return {"precision": precision, "recall": recall, "macro_f1": macro_f1, "accuracy": acc, "size": len(y_true)}, pred_rows
+
+
+@torch.no_grad()
+def collect_probs_labels(model: nn.Module, loader: DataLoader, device: torch.device) -> Tuple[List[int], List[float]]:
+    model.eval()
+    y_true: List[int] = []
+    prob_1: List[float] = []
+    for batch in loader:
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"].to(device)
+        extra_features = batch["extra_features"].to(device)
+        _, logits = model(input_ids, attention_mask, extra_features, labels)
+        probs = torch.softmax(logits, dim=-1)[:, 1]
+        y_true.extend(labels.cpu().tolist())
+        prob_1.extend(probs.cpu().tolist())
+    return y_true, prob_1
+
+
+def scan_thresholds(y_true: List[int], prob_1: List[float], thresholds: List[float]) -> Tuple[float, List[dict]]:
+    best_threshold = 0.5
+    best_macro_f1 = -1.0
+    rows: List[dict] = []
+    for thr in thresholds:
+        y_pred = [1 if p >= thr else 0 for p in prob_1]
+        precision, recall, macro_f1 = precision_recall_macro_f1(y_true, y_pred)
+        acc = sum(1 for t, p in zip(y_true, y_pred) if t == p) / max(1, len(y_true))
+        rows.append(
+            {
+                "threshold": float(thr),
+                "precision": precision,
+                "recall": recall,
+                "macro_f1": macro_f1,
+                "accuracy": acc,
+                "size": len(y_true),
+            }
+        )
+        if macro_f1 > best_macro_f1:
+            best_macro_f1 = macro_f1
+            best_threshold = float(thr)
+    return best_threshold, rows
 
 
 def save_csv(path: Path, rows: List[dict], fieldnames: List[str]) -> None:
@@ -289,6 +385,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Best baseline: T5-base + centrality + ChannelMix (no oversample, no z-score)")
     parser.add_argument("--nodes_csv", type=str, default="demo/tiage-1/outputs_nodes/tiage_anno_nodes_all.csv")
     parser.add_argument("--centrality_dir", type=str, default="demo/DGCN3/Centrality/alpha_1.5")
+    parser.add_argument("--sim_cache_csv", type=str, default="demo/tiage-1/tiage_similarity.csv")
+    parser.add_argument("--sim_model_name", type=str, default="sentence-transformers/all-MiniLM-L6-v2")
     parser.add_argument("--output_dir", type=str, default="demo/tiage-1/results_t5_base_channelmix_best_baseline")
     parser.add_argument("--model_name", type=str, default="t5-base")
     parser.add_argument("--epochs", type=int, default=20)
@@ -303,24 +401,26 @@ def main() -> None:
     parser.add_argument("--channelmix_layers", type=int, default=1)
     parser.add_argument("--channelmix_hidden_mult", type=int, default=4)
     parser.add_argument("--channelmix_dropout", type=float, default=0.1)
-    parser.add_argument("--fixed_threshold", type=float, default=0.5)
     args = parser.parse_args()
 
     set_seed(args.seed)
     root = Path(".").resolve()
     nodes_csv = (root / args.nodes_csv).resolve()
     centrality_dir = (root / args.centrality_dir).resolve()
+    sim_cache_csv = (root / args.sim_cache_csv).resolve()
     output_dir = (root / args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[INFO] nodes_csv={nodes_csv}")
     print(f"[INFO] centrality_dir={centrality_dir}")
+    print(f"[INFO] sim_cache_csv={sim_cache_csv}")
     print(f"[INFO] output_dir={output_dir}")
     print(f"[INFO] model={args.model_name} context_turns={args.context_turns} batch_size={args.batch_size}")
 
     rows = parse_nodes(nodes_csv)
     centrality = load_centrality(centrality_dir, args.num_slices)
-    split_samples = build_samples(rows, centrality, args.context_turns)
+    sim_resp_last1_map = load_or_build_similarity_cache(rows, sim_cache_csv, args.sim_model_name)
+    split_samples = build_samples(rows, centrality, sim_resp_last1_map, args.context_turns)
     for split in ("train", "dev", "test"):
         print(f"[INFO] {split} samples={len(split_samples[split])}")
 
@@ -371,7 +471,7 @@ def main() -> None:
             scheduler.step()
             total_loss += loss.item()
 
-        dev_metrics, _ = evaluate(model, dev_loader, device, threshold=args.fixed_threshold)
+        dev_metrics, _ = evaluate(model, dev_loader, device, threshold=0.5)
         avg_loss = total_loss / max(1, len(train_loader))
         print(
             f"[EPOCH {epoch}] train_loss={avg_loss:.4f} "
@@ -388,16 +488,25 @@ def main() -> None:
     print(f"[INFO] best dev Macro-F1={best_dev:.4f} at epoch={best_epoch} (prf_sum={best_score:.4f})")
 
     model.load_state_dict(torch.load(best_path, map_location=device))
-    print(f"[INFO] fixed_threshold={args.fixed_threshold:.2f}")
+    y_true_dev, prob_1_dev = collect_probs_labels(model, dev_loader, device)
+    thresholds = [float(t) for t in np.arange(0.45, 0.66, 0.005)]
+    best_threshold, threshold_rows = scan_thresholds(y_true_dev, prob_1_dev, thresholds)
+    print(f"[INFO] best_threshold_on_dev={best_threshold:.3f}")
 
-    train_metrics, train_rows = evaluate(model, train_eval_loader, device, threshold=args.fixed_threshold)
-    dev_metrics, dev_rows = evaluate(model, dev_loader, device, threshold=args.fixed_threshold)
-    test_metrics, test_rows = evaluate(model, test_loader, device, threshold=args.fixed_threshold)
+    save_csv(
+        output_dir / "threshold_metrics.csv",
+        threshold_rows,
+        ["threshold", "precision", "recall", "macro_f1", "accuracy", "size"],
+    )
+
+    train_metrics, train_rows = evaluate(model, train_eval_loader, device, threshold=best_threshold)
+    dev_metrics, dev_rows = evaluate(model, dev_loader, device, threshold=best_threshold)
+    test_metrics, test_rows = evaluate(model, test_loader, device, threshold=best_threshold)
 
     metrics_rows = [
-        {"split": "train", "best_epoch": best_epoch, "best_threshold": args.fixed_threshold, "model_name": args.model_name, "use_channelmix": 1, **train_metrics},
-        {"split": "dev", "best_epoch": best_epoch, "best_threshold": args.fixed_threshold, "model_name": args.model_name, "use_channelmix": 1, **dev_metrics},
-        {"split": "test", "best_epoch": best_epoch, "best_threshold": args.fixed_threshold, "model_name": args.model_name, "use_channelmix": 1, **test_metrics},
+        {"split": "train", "best_epoch": best_epoch, "best_threshold": best_threshold, "model_name": args.model_name, "use_channelmix": 1, **train_metrics},
+        {"split": "dev", "best_epoch": best_epoch, "best_threshold": best_threshold, "model_name": args.model_name, "use_channelmix": 1, **dev_metrics},
+        {"split": "test", "best_epoch": best_epoch, "best_threshold": best_threshold, "model_name": args.model_name, "use_channelmix": 1, **test_metrics},
     ]
     save_csv(
         output_dir / "metrics.csv",
@@ -407,7 +516,7 @@ def main() -> None:
     save_csv(
         output_dir / "predictions.csv",
         train_rows + dev_rows + test_rows,
-        ["split", "dialog_id", "turn_id", "node_id", "label", "pred", "prob_1", "centrality"],
+        ["split", "dialog_id", "turn_id", "node_id", "label", "pred", "prob_1", "centrality", "sim_resp_last1"],
     )
 
     print("[RESULT] Test metrics")
@@ -415,6 +524,7 @@ def main() -> None:
     print(f"Recall:    {test_metrics['recall']:.4f}")
     print(f"Macro-F1:  {test_metrics['macro_f1']:.4f}")
     print(f"[SAVED] {output_dir / 'metrics.csv'}")
+    print(f"[SAVED] {output_dir / 'threshold_metrics.csv'}")
     print(f"[SAVED] {output_dir / 'predictions.csv'}")
 
 
