@@ -1,6 +1,7 @@
 import argparse
 import csv
-import random
+import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -9,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-from transformers import AutoTokenizer, T5EncoderModel, get_linear_schedule_with_warmup
+from transformers import AutoTokenizer, T5EncoderModel
 
 
 @dataclass
@@ -23,10 +24,14 @@ class Sample:
     centrality: float
 
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+def parse_range(spec: str) -> Tuple[int, int]:
+    m = re.match(r"^\s*(\d+)\s*-\s*(\d+)\s*$", spec)
+    if not m:
+        raise ValueError(f"Invalid range: {spec}. Expected like 101-200")
+    start, end = int(m.group(1)), int(m.group(2))
+    if start < 1 or end < start:
+        raise ValueError(f"Invalid range values: {spec}")
+    return start, end
 
 
 def parse_nodes(nodes_csv: Path) -> List[dict]:
@@ -93,7 +98,7 @@ def build_samples(rows: List[dict], centrality: Dict[int, float], context_turns:
                 f"response: {cur['text']} [CEN={cur_c:.4f}]"
             )
 
-            sample = Sample(
+            s = Sample(
                 split=split,
                 dialog_id=cur["dialog_id"],
                 turn_id=cur["turn_id"],
@@ -103,7 +108,7 @@ def build_samples(rows: List[dict], centrality: Dict[int, float], context_turns:
                 centrality=cur_c,
             )
             if split in result:
-                result[split].append(sample)
+                result[split].append(s)
     return result
 
 
@@ -169,9 +174,10 @@ class T5Baseline(nn.Module):
         channelmix_layers: int = 1,
         channelmix_hidden_mult: int = 4,
         channelmix_dropout: float = 0.1,
+        local_files_only: bool = True,
     ):
         super().__init__()
-        self.encoder = T5EncoderModel.from_pretrained(model_name)
+        self.encoder = T5EncoderModel.from_pretrained(model_name, local_files_only=local_files_only)
         hidden = self.encoder.config.d_model
         self.channelmix_stack = nn.ModuleList(
             [RWKVChannelMix(hidden, hidden_mult=channelmix_hidden_mult, dropout=channelmix_dropout) for _ in range(max(0, channelmix_layers))]
@@ -185,7 +191,11 @@ class T5Baseline(nn.Module):
             nn.Linear(hidden, 2),
         )
 
-    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, extra_features: torch.Tensor, labels: torch.Tensor = None):
+    def encode_semantic(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
         out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
         hs = out.last_hidden_state
         for block in self.channelmix_stack:
@@ -194,208 +204,139 @@ class T5Baseline(nn.Module):
         attn_logits = attn_logits.masked_fill(attention_mask == 0, -1e9)
         attn_weight = torch.softmax(attn_logits, dim=-1).unsqueeze(-1)
         pooled = (hs * attn_weight).sum(dim=1)
+        return pooled
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, extra_features: torch.Tensor):
+        pooled = self.encode_semantic(input_ids, attention_mask)
         feats = self.feature_norm(extra_features)
         logits = self.classifier(torch.cat([pooled, feats], dim=-1))
-        loss = None
-        if labels is not None:
-            loss = F.cross_entropy(logits, labels)
-        return loss, logits
-
-
-def precision_recall_macro_f1(y_true: List[int], y_pred: List[int]) -> Tuple[float, float, float]:
-    p_list: List[float] = []
-    r_list: List[float] = []
-    f_list: List[float] = []
-    for cls in (0, 1):
-        tp = sum(1 for t, p in zip(y_true, y_pred) if t == cls and p == cls)
-        fp = sum(1 for t, p in zip(y_true, y_pred) if t != cls and p == cls)
-        fn = sum(1 for t, p in zip(y_true, y_pred) if t == cls and p != cls)
-        p = tp / (tp + fp) if (tp + fp) else 0.0
-        r = tp / (tp + fn) if (tp + fn) else 0.0
-        f = (2 * p * r / (p + r)) if (p + r) else 0.0
-        p_list.append(p)
-        r_list.append(r)
-        f_list.append(f)
-    return sum(p_list) / 2.0, sum(r_list) / 2.0, sum(f_list) / 2.0
+        return pooled, logits
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, threshold: float = 0.5):
+def extract_features(model: T5Baseline, loader: DataLoader, device: torch.device, threshold: float) -> List[dict]:
     model.eval()
-    y_true: List[int] = []
-    y_pred: List[int] = []
-    pred_rows: List[dict] = []
-
+    rows: List[dict] = []
     for batch in loader:
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
-        labels = batch["labels"].to(device)
         extra_features = batch["extra_features"].to(device)
-        _, logits = model(input_ids, attention_mask, extra_features, labels)
+        pooled, logits = model(input_ids, attention_mask, extra_features)
         probs = torch.softmax(logits, dim=-1)
-        pred = (probs[:, 1] >= threshold).long()
+        p_shift = probs[:, 1]
+        y_hat = (p_shift >= threshold).long()
 
-        y_true.extend(labels.cpu().tolist())
-        y_pred.extend(pred.cpu().tolist())
-        probs1 = probs[:, 1].cpu().tolist()
-        for m, t, p, p1 in zip(batch["meta"], labels.cpu().tolist(), pred.cpu().tolist(), probs1):
-            pred_rows.append(
+        pooled_np = pooled.detach().cpu().tolist()
+        p_shift_np = p_shift.detach().cpu().tolist()
+        y_hat_np = y_hat.detach().cpu().tolist()
+        for m, h_t, p_s, y_p in zip(batch["meta"], pooled_np, p_shift_np, y_hat_np):
+            rows.append(
                 {
                     "split": m.split,
                     "dialog_id": m.dialog_id,
                     "turn_id": m.turn_id,
                     "node_id": m.node_id,
-                    "label": t,
-                    "pred": p,
-                    "prob_1": float(p1),
-                    "centrality": float(m.centrality),
+                    "label": m.label,
+                    "h_t": h_t,
+                    "p_shift": float(p_s),
+                    "y_hat_shift": int(y_p),
                 }
             )
-
-    precision, recall, macro_f1 = precision_recall_macro_f1(y_true, y_pred)
-    acc = sum(1 for t, p in zip(y_true, y_pred) if t == p) / len(y_true)
-    return {"precision": precision, "recall": recall, "macro_f1": macro_f1, "accuracy": acc, "size": len(y_true)}, pred_rows
-
-
-def save_csv(path: Path, rows: List[dict], fieldnames: List[str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+    return rows
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Best baseline: T5-base + centrality + ChannelMix (no oversample, no z-score)")
+    parser = argparse.ArgumentParser(description="Export stage-2 semantic representation and shift outputs.")
     parser.add_argument("--nodes_csv", type=str, default="demo/tiage-1/outputs_nodes/tiage_anno_nodes_all.csv")
     parser.add_argument("--centrality_dir", type=str, default="demo/DGCN3/Centrality/alpha_1.5")
-    parser.add_argument("--output_dir", type=str, default="demo/tiage-1/results_t5_base_channelmix_best_baseline")
     parser.add_argument("--model_name", type=str, default="t5-base")
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=2e-5)
-    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--local_files_only", action="store_true", default=True)
+    parser.add_argument("--model_ckpt", type=str, default="demo/tiage-1/results_t5_base_channelmix_best_baseline/best_model.pt")
+    parser.add_argument("--output_json", type=str, default="demo/tiage-1/stage2_shift_features_selected.json")
+
     parser.add_argument("--max_length", type=int, default=384)
     parser.add_argument("--context_turns", type=int, default=16)
     parser.add_argument("--num_slices", type=int, default=10)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--classifier_dropout", type=float, default=0.2)
     parser.add_argument("--channelmix_layers", type=int, default=1)
     parser.add_argument("--channelmix_hidden_mult", type=int, default=4)
     parser.add_argument("--channelmix_dropout", type=float, default=0.1)
-    parser.add_argument("--fixed_threshold", type=float, default=0.5)
+
+    parser.add_argument("--train_range", type=str, default="101-200")
+    parser.add_argument("--dev_range", type=str, default="1-50")
+    parser.add_argument("--test_range", type=str, default="1-50")
     args = parser.parse_args()
 
-    set_seed(args.seed)
     root = Path(".").resolve()
     nodes_csv = (root / args.nodes_csv).resolve()
     centrality_dir = (root / args.centrality_dir).resolve()
-    output_dir = (root / args.output_dir).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"[INFO] nodes_csv={nodes_csv}")
-    print(f"[INFO] centrality_dir={centrality_dir}")
-    print(f"[INFO] output_dir={output_dir}")
-    print(f"[INFO] model={args.model_name} context_turns={args.context_turns} batch_size={args.batch_size}")
+    model_ckpt = (root / args.model_ckpt).resolve()
+    output_json = (root / args.output_json).resolve()
 
     rows = parse_nodes(nodes_csv)
     centrality = load_centrality(centrality_dir, args.num_slices)
     split_samples = build_samples(rows, centrality, args.context_turns)
-    for split in ("train", "dev", "test"):
-        print(f"[INFO] {split} samples={len(split_samples[split])}")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    train_start, train_end = parse_range(args.train_range)
+    dev_start, dev_end = parse_range(args.dev_range)
+    test_start, test_end = parse_range(args.test_range)
+    selected = {
+        "train": split_samples["train"][train_start - 1 : min(train_end, len(split_samples["train"]))],
+        "dev": split_samples["dev"][dev_start - 1 : min(dev_end, len(split_samples["dev"]))],
+        "test": split_samples["test"][test_start - 1 : min(test_end, len(split_samples["test"]))],
+    }
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, local_files_only=args.local_files_only)
     model = T5Baseline(
         model_name=args.model_name,
         dropout=args.classifier_dropout,
         channelmix_layers=args.channelmix_layers,
         channelmix_hidden_mult=args.channelmix_hidden_mult,
         channelmix_dropout=args.channelmix_dropout,
+        local_files_only=args.local_files_only,
     )
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-    print(f"[INFO] device={device}")
+    model.load_state_dict(torch.load(model_ckpt, map_location=device))
 
     collator = Collator(tokenizer, args.max_length)
-    train_loader = DataLoader(TiageDataset(split_samples["train"]), batch_size=args.batch_size, shuffle=True, collate_fn=collator)
-    train_eval_loader = DataLoader(TiageDataset(split_samples["train"]), batch_size=args.batch_size, shuffle=False, collate_fn=collator)
-    dev_loader = DataLoader(TiageDataset(split_samples["dev"]), batch_size=args.batch_size, shuffle=False, collate_fn=collator)
-    test_loader = DataLoader(TiageDataset(split_samples["test"]), batch_size=args.batch_size, shuffle=False, collate_fn=collator)
+    loaders = {
+        k: DataLoader(TiageDataset(v), batch_size=args.batch_size, shuffle=False, collate_fn=collator)
+        for k, v in selected.items()
+    }
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    total_steps = len(train_loader) * args.epochs
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=max(1, int(0.1 * total_steps)),
-        num_training_steps=max(1, total_steps),
-    )
+    output = {
+        "config": {
+            "nodes_csv": str(nodes_csv),
+            "centrality_dir": str(centrality_dir),
+            "model_ckpt": str(model_ckpt),
+            "model_name": args.model_name,
+            "context_turns": args.context_turns,
+            "max_length": args.max_length,
+            "threshold": args.threshold,
+            "ranges": {"train": args.train_range, "dev": args.dev_range, "test": args.test_range},
+        },
+        "splits": {
+            "train": extract_features(model, loaders["train"], device, args.threshold),
+            "dev": extract_features(model, loaders["dev"], device, args.threshold),
+            "test": extract_features(model, loaders["test"], device, args.threshold),
+        },
+    }
 
-    best_dev = -1.0
-    best_score = -1.0
-    best_epoch = 0
-    best_path = output_dir / "best_model.pt"
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        total_loss = 0.0
-        for batch in train_loader:
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
-            extra_features = batch["extra_features"].to(device)
+    output_json.parent.mkdir(parents=True, exist_ok=True)
+    with output_json.open("w", encoding="utf-8") as f:
+        json.dump(output, f, ensure_ascii=False)
 
-            loss, _ = model(input_ids, attention_mask, extra_features, labels)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
-            total_loss += loss.item()
-
-        dev_metrics, _ = evaluate(model, dev_loader, device, threshold=args.fixed_threshold)
-        avg_loss = total_loss / max(1, len(train_loader))
-        print(
-            f"[EPOCH {epoch}] train_loss={avg_loss:.4f} "
-            f"dev_P={dev_metrics['precision']:.4f} dev_R={dev_metrics['recall']:.4f} "
-            f"dev_MacroF1={dev_metrics['macro_f1']:.4f}"
+    print(f"[SAVED] {output_json}")
+    print(
+        "[COUNT] train={} dev={} test={}".format(
+            len(output["splits"]["train"]),
+            len(output["splits"]["dev"]),
+            len(output["splits"]["test"]),
         )
-        current_score = dev_metrics["precision"] + dev_metrics["recall"] + dev_metrics["macro_f1"]
-        if current_score > best_score:
-            best_score = current_score
-            best_dev = dev_metrics["macro_f1"]
-            best_epoch = epoch
-            torch.save(model.state_dict(), best_path)
-
-    print(f"[INFO] best dev Macro-F1={best_dev:.4f} at epoch={best_epoch} (prf_sum={best_score:.4f})")
-
-    model.load_state_dict(torch.load(best_path, map_location=device))
-    print(f"[INFO] fixed_threshold={args.fixed_threshold:.2f}")
-
-    train_metrics, train_rows = evaluate(model, train_eval_loader, device, threshold=args.fixed_threshold)
-    dev_metrics, dev_rows = evaluate(model, dev_loader, device, threshold=args.fixed_threshold)
-    test_metrics, test_rows = evaluate(model, test_loader, device, threshold=args.fixed_threshold)
-
-    metrics_rows = [
-        {"split": "train", "best_epoch": best_epoch, "best_threshold": args.fixed_threshold, "model_name": args.model_name, "use_channelmix": 1, **train_metrics},
-        {"split": "dev", "best_epoch": best_epoch, "best_threshold": args.fixed_threshold, "model_name": args.model_name, "use_channelmix": 1, **dev_metrics},
-        {"split": "test", "best_epoch": best_epoch, "best_threshold": args.fixed_threshold, "model_name": args.model_name, "use_channelmix": 1, **test_metrics},
-    ]
-    save_csv(
-        output_dir / "metrics.csv",
-        metrics_rows,
-        ["split", "best_epoch", "best_threshold", "model_name", "use_channelmix", "precision", "recall", "macro_f1", "accuracy", "size"],
     )
-    save_csv(
-        output_dir / "predictions.csv",
-        train_rows + dev_rows + test_rows,
-        ["split", "dialog_id", "turn_id", "node_id", "label", "pred", "prob_1", "centrality"],
-    )
-
-    print("[RESULT] Test metrics")
-    print(f"Precision: {test_metrics['precision']:.4f}")
-    print(f"Recall:    {test_metrics['recall']:.4f}")
-    print(f"Macro-F1:  {test_metrics['macro_f1']:.4f}")
-    print(f"[SAVED] {output_dir / 'metrics.csv'}")
-    print(f"[SAVED] {output_dir / 'predictions.csv'}")
 
 
 if __name__ == "__main__":

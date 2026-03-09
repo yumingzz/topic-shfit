@@ -1,0 +1,7 @@
+{
+  "best_epoch": 14,
+  "best_dev_score": 1.4942061483044213,
+  "test_kendall_tau": 0.5391304347826088,
+  "test_ndcg_at_5": 0.9096520519000345,
+  "num_test_samples": 46
+}

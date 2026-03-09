@@ -21,42 +21,14 @@ class Sample:
     turn_id: int
     node_id: int
     text: str
-    context_text: str
-    response_text: str
     label: int
     centrality: float
-    community_ratio: float
-    sim_ctx_resp: float
-    sim_resp_last1: float
-    sim_resp_lastk_max: float
 
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-
-def _tf_vector(text: str) -> Dict[str, float]:
-    vec: Dict[str, float] = {}
-    for tok in text.lower().split():
-        vec[tok] = vec.get(tok, 0.0) + 1.0
-    return vec
-
-
-def cosine_sim_text(a: str, b: str) -> float:
-    va = _tf_vector(a)
-    vb = _tf_vector(b)
-    if not va or not vb:
-        return 0.0
-    dot = 0.0
-    for k, v in va.items():
-        dot += v * vb.get(k, 0.0)
-    na = sum(v * v for v in va.values()) ** 0.5
-    nb = sum(v * v for v in vb.values()) ** 0.5
-    if na == 0.0 or nb == 0.0:
-        return 0.0
-    return dot / (na * nb)
 
 
 def parse_nodes(nodes_csv: Path) -> List[dict]:
@@ -163,12 +135,7 @@ def compute_louvain_feature(
 def build_samples(
     rows: List[dict],
     centrality: Dict[int, float],
-    community_ratio: Dict[int, float],
     context_turns: int,
-    use_sim_ctx_resp: bool = False,
-    use_sim_resp_last1: bool = False,
-    use_sim_resp_lastk_max: bool = False,
-    last_k: int = 3,
 ) -> Dict[str, List[Sample]]:
     by_dialog: Dict[Tuple[str, int], List[dict]] = {}
     for r in rows:
@@ -190,38 +157,15 @@ def build_samples(
             ctx_parts: List[str] = []
             for h in hist:
                 h_c = centrality.get(h["node_id"], 0.0)
-                h_m = community_ratio.get(h["node_id"], 0.0)
-                ctx_parts.append(f"{h['text']} [CEN={h_c:.4f}] [COM={h_m:.4f}]")
+                ctx_parts.append(f"{h['text']} [CEN={h_c:.4f}]")
 
             cur_c = centrality.get(cur["node_id"], 0.0)
-            cur_m = community_ratio.get(cur["node_id"], 0.0)
+
             context_text = " </s> ".join(ctx_parts) if ctx_parts else "<no_context>"
-            response_text = str(cur["text"])
-            sim_ctx_resp = cosine_sim_text(response_text, context_text) if use_sim_ctx_resp else 0.0
-            if i - 1 >= 0:
-                sim_resp_last1 = cosine_sim_text(response_text, str(turns[i - 1]["text"])) if use_sim_resp_last1 else 0.0
-            else:
-                sim_resp_last1 = 0.0
-            start = max(0, i - max(1, last_k))
-            lastk_texts = [str(turns[j]["text"]) for j in range(start, i)]
-            if lastk_texts and use_sim_resp_lastk_max:
-                sim_resp_lastk_max = max(cosine_sim_text(response_text, t) for t in lastk_texts)
-            else:
-                sim_resp_lastk_max = 0.0
-
-            sim_tags: List[str] = []
-            if use_sim_ctx_resp:
-                sim_tags.append(f"[SIM_CTX={sim_ctx_resp:.4f}]")
-            if use_sim_resp_last1:
-                sim_tags.append(f"[SIM_LAST1={sim_resp_last1:.4f}]")
-            if use_sim_resp_lastk_max:
-                sim_tags.append(f"[SIM_LASTK={sim_resp_lastk_max:.4f}]")
-            sim_tag_text = " " + " ".join(sim_tags) if sim_tags else ""
-
             text = (
                 f"task: topic shift detection\\n"
                 f"context: {context_text}\\n"
-                f"response: {response_text} [CEN={cur_c:.4f}] [COM={cur_m:.4f}]{sim_tag_text}"
+                f"response: {cur['text']} [CEN={cur_c:.4f}]"
             )
 
             sample = Sample(
@@ -230,14 +174,8 @@ def build_samples(
                 turn_id=cur["turn_id"],
                 node_id=cur["node_id"],
                 text=text,
-                context_text=context_text,
-                response_text=response_text,
                 label=label,
                 centrality=cur_c,
-                community_ratio=cur_m,
-                sim_ctx_resp=sim_ctx_resp,
-                sim_resp_last1=sim_resp_last1,
-                sim_resp_lastk_max=sim_resp_lastk_max,
             )
             if split in result:
                 result[split].append(sample)
@@ -257,23 +195,9 @@ class TiageDataset(Dataset):
 
 
 class Collator:
-    def __init__(
-        self,
-        tokenizer,
-        max_length: int,
-        context_max_length: int,
-        response_max_length: int,
-        use_sim_ctx_resp: bool = False,
-        use_sim_resp_last1: bool = False,
-        use_sim_resp_lastk_max: bool = False,
-    ):
+    def __init__(self, tokenizer, max_length: int):
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.context_max_length = context_max_length
-        self.response_max_length = response_max_length
-        self.use_sim_ctx_resp = use_sim_ctx_resp
-        self.use_sim_resp_last1 = use_sim_resp_last1
-        self.use_sim_resp_lastk_max = use_sim_resp_lastk_max
 
     def __call__(self, batch: List[Sample]) -> dict:
         texts = [x.text for x in batch]
@@ -284,42 +208,12 @@ class Collator:
             max_length=self.max_length,
             return_tensors="pt",
         )
-        context_texts = [x.context_text for x in batch]
-        response_texts = [x.response_text for x in batch]
-        tok_ctx = self.tokenizer(
-            context_texts,
-            padding=True,
-            truncation=True,
-            max_length=self.context_max_length,
-            return_tensors="pt",
-        )
-        tok_rsp = self.tokenizer(
-            response_texts,
-            padding=True,
-            truncation=True,
-            max_length=self.response_max_length,
-            return_tensors="pt",
-        )
         labels = torch.tensor([x.label for x in batch], dtype=torch.long)
-        feat_rows: List[List[float]] = []
-        for x in batch:
-            row = [x.centrality, x.community_ratio]
-            if self.use_sim_ctx_resp:
-                row.append(x.sim_ctx_resp)
-            if self.use_sim_resp_last1:
-                row.append(x.sim_resp_last1)
-            if self.use_sim_resp_lastk_max:
-                row.append(x.sim_resp_lastk_max)
-            feat_rows.append(row)
-        feats = torch.tensor(feat_rows, dtype=torch.float)
+        feats = torch.tensor([[x.centrality] for x in batch], dtype=torch.float)
 
         return {
             "input_ids": tok["input_ids"],
             "attention_mask": tok["attention_mask"],
-            "context_input_ids": tok_ctx["input_ids"],
-            "context_attention_mask": tok_ctx["attention_mask"],
-            "response_input_ids": tok_rsp["input_ids"],
-            "response_attention_mask": tok_rsp["attention_mask"],
             "labels": labels,
             "extra_features": feats,
             "meta": batch,
@@ -351,7 +245,6 @@ class T5ShiftClassifier(nn.Module):
         model_name: str,
         dropout: float = 0.1,
         use_channelmix: bool = False,
-        use_interaction_head: bool = True,
         channelmix_layers: int = 1,
         channelmix_hidden_mult: int = 4,
         channelmix_dropout: float = 0.1,
@@ -361,7 +254,6 @@ class T5ShiftClassifier(nn.Module):
         self.encoder = T5EncoderModel.from_pretrained(model_name)
         hidden = self.encoder.config.d_model
         self.use_channelmix = use_channelmix
-        self.use_interaction_head = use_interaction_head
         self.channelmix_stack = nn.ModuleList(
             [
                 RWKVChannelMix(
@@ -373,20 +265,21 @@ class T5ShiftClassifier(nn.Module):
             ]
         )
         self.feature_norm = nn.LayerNorm(num_extra_features)
-        self.interaction_proj = nn.Sequential(
-            nn.Linear(hidden * 2, hidden),
-            nn.Tanh(),
-            nn.Dropout(dropout),
-        )
-        classifier_in = hidden + num_extra_features + (hidden if use_interaction_head else 0)
         self.classifier = nn.Sequential(
-            nn.Linear(classifier_in, hidden),
+            nn.Linear(hidden + num_extra_features, hidden),
             nn.Tanh(),
             nn.Dropout(dropout),
             nn.Linear(hidden, 2),
         )
 
-    def _encode_pooled(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        extra_features: torch.Tensor,
+        labels: torch.Tensor = None,
+        class_weights: torch.Tensor = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
         hs = out.last_hidden_state
         if self.use_channelmix:
@@ -394,31 +287,8 @@ class T5ShiftClassifier(nn.Module):
                 hs = block(hs)
         mask = attention_mask.unsqueeze(-1).float()
         pooled = (hs * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
-        return pooled
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        extra_features: torch.Tensor,
-        context_input_ids: torch.Tensor = None,
-        context_attention_mask: torch.Tensor = None,
-        response_input_ids: torch.Tensor = None,
-        response_attention_mask: torch.Tensor = None,
-        labels: torch.Tensor = None,
-        class_weights: torch.Tensor = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        pooled = self._encode_pooled(input_ids, attention_mask)
         feats = self.feature_norm(extra_features)
-        parts = [pooled]
-        if self.use_interaction_head and context_input_ids is not None and response_input_ids is not None:
-            h_ctx = self._encode_pooled(context_input_ids, context_attention_mask)
-            h_rsp = self._encode_pooled(response_input_ids, response_attention_mask)
-            interaction = torch.cat([torch.abs(h_ctx - h_rsp), h_ctx * h_rsp], dim=-1)
-            interaction = self.interaction_proj(interaction)
-            parts.append(interaction)
-        parts.append(feats)
-        logits = self.classifier(torch.cat(parts, dim=-1))
+        logits = self.classifier(torch.cat([pooled, feats], dim=-1))
 
         loss = None
         if labels is not None:
@@ -460,10 +330,6 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, thresho
     for batch in loader:
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
-        context_input_ids = batch["context_input_ids"].to(device)
-        context_attention_mask = batch["context_attention_mask"].to(device)
-        response_input_ids = batch["response_input_ids"].to(device)
-        response_attention_mask = batch["response_attention_mask"].to(device)
         labels = batch["labels"].to(device)
         extra_features = batch["extra_features"].to(device)
 
@@ -471,10 +337,6 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, thresho
             input_ids=input_ids,
             attention_mask=attention_mask,
             extra_features=extra_features,
-            context_input_ids=context_input_ids,
-            context_attention_mask=context_attention_mask,
-            response_input_ids=response_input_ids,
-            response_attention_mask=response_attention_mask,
             labels=labels,
         )
 
@@ -496,10 +358,6 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, thresho
                     "pred": p,
                     "prob_1": float(p1),
                     "centrality": float(m.centrality),
-                    "community_ratio": float(m.community_ratio),
-                    "sim_ctx_resp": float(m.sim_ctx_resp),
-                    "sim_resp_last1": float(m.sim_resp_last1),
-                    "sim_resp_lastk_max": float(m.sim_resp_lastk_max),
                 }
             )
 
@@ -530,20 +388,12 @@ def find_best_threshold(
     for batch in loader:
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
-        context_input_ids = batch["context_input_ids"].to(device)
-        context_attention_mask = batch["context_attention_mask"].to(device)
-        response_input_ids = batch["response_input_ids"].to(device)
-        response_attention_mask = batch["response_attention_mask"].to(device)
         labels = batch["labels"].to(device)
         extra_features = batch["extra_features"].to(device)
         _, logits = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             extra_features=extra_features,
-            context_input_ids=context_input_ids,
-            context_attention_mask=context_attention_mask,
-            response_input_ids=response_input_ids,
-            response_attention_mask=response_attention_mask,
             labels=labels,
         )
         probs = torch.softmax(logits, dim=-1)[:, 1]
@@ -571,19 +421,6 @@ def compute_class_weights(train_samples: List[Sample]) -> torch.Tensor:
     w0 = total / max(1, 2 * count0)
     w1 = total / max(1, 2 * count1)
     return torch.tensor([w0, w1], dtype=torch.float)
-
-
-def apply_train_zscore(split_samples: Dict[str, List[Sample]], eps: float = 1e-8) -> Tuple[float, float]:
-    train_vals = [s.centrality for s in split_samples.get("train", [])]
-    if not train_vals:
-        return 0.0, 1.0
-    mean = sum(train_vals) / float(len(train_vals))
-    var = sum((x - mean) ** 2 for x in train_vals) / float(len(train_vals))
-    std = (var + eps) ** 0.5
-    for split in ("train", "dev", "test"):
-        for s in split_samples.get(split, []):
-            s.centrality = (s.centrality - mean) / std
-    return mean, std
 
 
 def build_oversample_sampler(train_samples: List[Sample]) -> WeightedRandomSampler:
@@ -616,26 +453,20 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_length", type=int, default=384)
-    parser.add_argument("--context_max_length", type=int, default=320)
-    parser.add_argument("--response_max_length", type=int, default=96)
-    parser.add_argument("--context_turns", type=int, default=16)
-    parser.add_argument("--sim_last_k", type=int, default=3, help="k for sim_resp_lastk_max feature.")
-    parser.add_argument("--use_sim_ctx_resp", action="store_true", help="Use sim_ctx_resp as numeric/text feature.")
-    parser.add_argument("--use_sim_resp_last1", action="store_true", help="Use sim_resp_last1 as numeric/text feature.")
-    parser.add_argument("--use_sim_resp_lastk_max", action="store_true", help="Use sim_resp_lastk_max as numeric/text feature.")
+    # parser.add_argument("--context_turns", type=int, default=16)
+    parser.add_argument("--context_turns", type=int, default=5)
     parser.add_argument("--num_slices", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--classifier_dropout", type=float, default=0.2)
+    parser.add_argument("--classifier_dropout", type=float, default=0.1)
     parser.add_argument("--use_channelmix", action="store_true", help="Enable RWKV ChannelMix blocks after T5 encoder.")
-    parser.add_argument("--use_interaction_head", action="store_true", help="Enable minimal interaction head with ctx/resp interaction.")
     parser.add_argument("--channelmix_layers", type=int, default=1)
     parser.add_argument("--channelmix_hidden_mult", type=int, default=4)
     parser.add_argument("--channelmix_dropout", type=float, default=0.1)
     parser.add_argument("--no_class_weights", action="store_true", help="Disable class-weighted cross-entropy.")
     parser.add_argument("--no_oversample_train", action="store_true", help="Disable training oversampling for label=1.")
-    parser.add_argument("--no_zscore", action="store_true", help="Disable train-based z-score normalization for centrality.")
-    parser.add_argument("--fixed_threshold", type=float, default=0.5, help="Fixed decision threshold for train/dev/test evaluation.")
-    parser.add_argument("--best_model_select", type=str, default="prf_sum", choices=["macro_f1", "prf_sum"])
+    parser.add_argument("--thr_min", type=float, default=0.30)
+    parser.add_argument("--thr_max", type=float, default=0.70)
+    parser.add_argument("--thr_step", type=float, default=0.01)
     args = parser.parse_args()
     if args.use_channelmix and args.channelmix_layers < 1:
         raise ValueError("--channelmix_layers must be >= 1 when --use_channelmix is enabled.")
@@ -655,68 +486,31 @@ def main() -> None:
     print(f"[INFO] output_dir={output_dir}")
     print(
         f"[INFO] model={args.model_name} use_channelmix={args.use_channelmix} "
-        f"use_interaction_head={args.use_interaction_head} "
         f"channelmix_layers={args.channelmix_layers} max_length={args.max_length} "
-        f"context_max_length={args.context_max_length} response_max_length={args.response_max_length} "
-        f"context_turns={args.context_turns} sim_last_k={args.sim_last_k} batch_size={args.batch_size} "
-        f"use_sim_ctx_resp={args.use_sim_ctx_resp} use_sim_resp_last1={args.use_sim_resp_last1} "
-        f"use_sim_resp_lastk_max={args.use_sim_resp_lastk_max} fixed_threshold={args.fixed_threshold} "
-        f"best_model_select={args.best_model_select}"
+        f"context_turns={args.context_turns} batch_size={args.batch_size}"
     )
 
     rows = parse_nodes(nodes_csv)
     centrality, node_slice = load_centrality(centrality_dir, args.num_slices)
-    community_ratio, _bridge_ratio = compute_louvain_feature(
-        slices_txt_dir=slices_txt_dir,
-        node_slice=node_slice,
-        num_slices=args.num_slices,
-        seed=args.seed,
-    )
-
-    split_samples = build_samples(
-        rows,
-        centrality,
-        community_ratio,
-        args.context_turns,
-        use_sim_ctx_resp=args.use_sim_ctx_resp,
-        use_sim_resp_last1=args.use_sim_resp_last1,
-        use_sim_resp_lastk_max=args.use_sim_resp_lastk_max,
-        last_k=args.sim_last_k,
-    )
-    if args.no_zscore:
-        print("[INFO] centrality_zscore=disabled")
-    else:
-        z_mean, z_std = apply_train_zscore(split_samples)
-        print(f"[INFO] centrality_zscore_train_mean={z_mean:.6f} std={z_std:.6f}")
+    split_samples = build_samples(rows, centrality, args.context_turns)
     for split in ("train", "dev", "test"):
         print(f"[INFO] {split} samples={len(split_samples[split])}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    num_extra_features = 2 + int(args.use_sim_ctx_resp) + int(args.use_sim_resp_last1) + int(args.use_sim_resp_lastk_max)
     model = T5ShiftClassifier(
         model_name=args.model_name,
         dropout=args.classifier_dropout,
         use_channelmix=args.use_channelmix,
-        use_interaction_head=args.use_interaction_head,
         channelmix_layers=args.channelmix_layers,
         channelmix_hidden_mult=args.channelmix_hidden_mult,
         channelmix_dropout=args.channelmix_dropout,
-        num_extra_features=num_extra_features,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     print(f"[INFO] device={device}")
 
-    collator = Collator(
-        tokenizer,
-        args.max_length,
-        args.context_max_length,
-        args.response_max_length,
-        use_sim_ctx_resp=args.use_sim_ctx_resp,
-        use_sim_resp_last1=args.use_sim_resp_last1,
-        use_sim_resp_lastk_max=args.use_sim_resp_lastk_max,
-    )
+    collator = Collator(tokenizer, args.max_length)
 
     train_dataset = TiageDataset(split_samples["train"])
     dev_dataset = TiageDataset(split_samples["dev"])
@@ -747,7 +541,6 @@ def main() -> None:
     )
 
     best_dev = -1.0
-    best_score = -1.0
     best_epoch = 0
     best_path = output_dir / "best_model.pt"
 
@@ -758,10 +551,6 @@ def main() -> None:
         for batch in train_loader:
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
-            context_input_ids = batch["context_input_ids"].to(device)
-            context_attention_mask = batch["context_attention_mask"].to(device)
-            response_input_ids = batch["response_input_ids"].to(device)
-            response_attention_mask = batch["response_attention_mask"].to(device)
             labels = batch["labels"].to(device)
             extra_features = batch["extra_features"].to(device)
 
@@ -769,10 +558,6 @@ def main() -> None:
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 extra_features=extra_features,
-                context_input_ids=context_input_ids,
-                context_attention_mask=context_attention_mask,
-                response_input_ids=response_input_ids,
-                response_attention_mask=response_attention_mask,
                 labels=labels,
                 class_weights=class_weights,
             )
@@ -784,7 +569,7 @@ def main() -> None:
 
             total_loss += loss.item()
 
-        dev_metrics, _ = evaluate(model, dev_loader, device, threshold=args.fixed_threshold)
+        dev_metrics, _ = evaluate(model, dev_loader, device, threshold=0.5)
         avg_loss = total_loss / max(1, len(train_loader))
         print(
             f"[EPOCH {epoch}] train_loss={avg_loss:.4f} "
@@ -792,30 +577,32 @@ def main() -> None:
             f"dev_MacroF1={dev_metrics['macro_f1']:.4f}"
         )
 
-        if args.best_model_select == "prf_sum":
-            current_score = dev_metrics["precision"] + dev_metrics["recall"] + dev_metrics["macro_f1"]
-        else:
-            current_score = dev_metrics["macro_f1"]
-
-        if current_score > best_score:
-            best_score = current_score
+        if dev_metrics["macro_f1"] > best_dev:
             best_dev = dev_metrics["macro_f1"]
             best_epoch = epoch
             torch.save(model.state_dict(), best_path)
 
-    print(f"[INFO] best dev Macro-F1={best_dev:.4f} at epoch={best_epoch} (select={args.best_model_select}, score={best_score:.4f})")
+    print(f"[INFO] best dev Macro-F1={best_dev:.4f} at epoch={best_epoch}")
 
     model.load_state_dict(torch.load(best_path, map_location=device))
-    print(f"[INFO] fixed_threshold={args.fixed_threshold:.2f}")
+    best_threshold = find_best_threshold(
+        model=model,
+        loader=dev_loader,
+        device=device,
+        min_thr=args.thr_min,
+        max_thr=args.thr_max,
+        step=args.thr_step,
+    )
+    print(f"[INFO] best_threshold_on_dev={best_threshold:.2f}")
 
-    train_metrics, train_rows = evaluate(model, train_eval_loader, device, threshold=args.fixed_threshold)
-    dev_metrics, dev_rows = evaluate(model, dev_loader, device, threshold=args.fixed_threshold)
-    test_metrics, test_rows = evaluate(model, test_loader, device, threshold=args.fixed_threshold)
+    train_metrics, train_rows = evaluate(model, train_eval_loader, device, threshold=best_threshold)
+    dev_metrics, dev_rows = evaluate(model, dev_loader, device, threshold=best_threshold)
+    test_metrics, test_rows = evaluate(model, test_loader, device, threshold=best_threshold)
 
     metrics_rows = [
-        {"split": "train", "best_epoch": best_epoch, "best_threshold": args.fixed_threshold, "model_name": args.model_name, "use_channelmix": int(args.use_channelmix), **train_metrics},
-        {"split": "dev", "best_epoch": best_epoch, "best_threshold": args.fixed_threshold, "model_name": args.model_name, "use_channelmix": int(args.use_channelmix), **dev_metrics},
-        {"split": "test", "best_epoch": best_epoch, "best_threshold": args.fixed_threshold, "model_name": args.model_name, "use_channelmix": int(args.use_channelmix), **test_metrics},
+        {"split": "train", "best_epoch": best_epoch, "best_threshold": best_threshold, "model_name": args.model_name, "use_channelmix": int(args.use_channelmix), **train_metrics},
+        {"split": "dev", "best_epoch": best_epoch, "best_threshold": best_threshold, "model_name": args.model_name, "use_channelmix": int(args.use_channelmix), **dev_metrics},
+        {"split": "test", "best_epoch": best_epoch, "best_threshold": best_threshold, "model_name": args.model_name, "use_channelmix": int(args.use_channelmix), **test_metrics},
     ]
 
     save_csv(
@@ -826,20 +613,7 @@ def main() -> None:
     save_csv(
         output_dir / "predictions.csv",
         train_rows + dev_rows + test_rows,
-        [
-            "split",
-            "dialog_id",
-            "turn_id",
-            "node_id",
-            "label",
-            "pred",
-            "prob_1",
-            "centrality",
-            "community_ratio",
-            "sim_ctx_resp",
-            "sim_resp_last1",
-            "sim_resp_lastk_max",
-        ],
+        ["split", "dialog_id", "turn_id", "node_id", "label", "pred", "prob_1", "centrality"],
     )
 
     print("[RESULT] Test metrics")
