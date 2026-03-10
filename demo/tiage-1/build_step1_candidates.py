@@ -178,9 +178,12 @@ def main() -> None:
         type=str,
         default="demo/tiage-1/step1_candidates_top10.json",
     )
-    parser.add_argument("--train_range", type=str, default="101-200")
-    parser.add_argument("--dev_range", type=str, default="1-50")
-    parser.add_argument("--test_range", type=str, default="1-50")
+    # parser.add_argument("--train_range", type=str, default="101-200")
+    # parser.add_argument("--dev_range", type=str, default="1-50")
+    # parser.add_argument("--test_range", type=str, default="1-50")
+    parser.add_argument("--train_range", type=str, default="1-300")
+    parser.add_argument("--dev_range", type=str, default="1-100")
+    parser.add_argument("--test_range", type=str, default="1-100")
     parser.add_argument("--context_size", type=int, default=5)
     parser.add_argument("--top_k", type=int, default=10)
     parser.add_argument("--lambda_c", type=float, default=0.6)

@@ -1,7 +1,8 @@
 {
-  "best_epoch": 14,
-  "best_dev_score": 1.4942061483044213,
-  "test_kendall_tau": 0.5391304347826088,
-  "test_ndcg_at_5": 0.9096520519000345,
-  "num_test_samples": 46
+  "best_epoch": 4,
+  "best_dev_score": 2.3704225411542126,
+  "test_kendall_tau": 0.5130227001194749,
+  "test_ndcg_at_5": 0.9005911180223677,
+  "test_ndcg_at_3": 0.8769064460602557,
+  "num_test_samples": 93
 }

@@ -314,10 +314,11 @@ def build_samples(
 
 
 @torch.no_grad()
-def evaluate(model: Stage3Reranker, samples: List[dict]) -> Tuple[float, float, List[dict]]:
+def evaluate(model: Stage3Reranker, samples: List[dict]) -> Tuple[float, float, float, List[dict]]:
     model.eval()
     taus: List[float] = []
     ndcgs: List[float] = []
+    ndcgs3: List[float] = []
     rows: List[dict] = []
 
     for s in samples:
@@ -325,8 +326,10 @@ def evaluate(model: Stage3Reranker, samples: List[dict]) -> Tuple[float, float, 
         tgt = s["target"].detach().cpu().tolist()
         tau = kendall_tau_a(tgt, pred)
         nd = ndcg_at_k(tgt, pred, k=5)
+        nd3 = ndcg_at_k(tgt, pred, k=3)
         taus.append(tau)
         ndcgs.append(nd)
+        ndcgs3.append(nd3)
 
         order = sorted(range(len(pred)), key=lambda i: pred[i], reverse=True)
         rows.append(
@@ -337,6 +340,7 @@ def evaluate(model: Stage3Reranker, samples: List[dict]) -> Tuple[float, float, 
                 "node_id": s["meta"][3],
                 "kendall_tau": tau,
                 "ndcg_at_5": nd,
+                "ndcg_at_3": nd3,
                 "reranked_nodes": [s["node_ids"][i] for i in order],
                 "pred_scores": [pred[i] for i in order],
             }
@@ -344,7 +348,8 @@ def evaluate(model: Stage3Reranker, samples: List[dict]) -> Tuple[float, float, 
 
     mean_tau = sum(taus) / max(1, len(taus))
     mean_ndcg = sum(ndcgs) / max(1, len(ndcgs))
-    return mean_tau, mean_ndcg, rows
+    mean_ndcg3 = sum(ndcgs3) / max(1, len(ndcgs3))
+    return mean_tau, mean_ndcg, mean_ndcg3, rows
 
 
 def main() -> None:
@@ -426,11 +431,11 @@ def main() -> None:
             optimizer.step()
             total_loss += float(loss.item())
 
-        dev_tau, dev_ndcg, _ = evaluate(model, samples["dev"])
-        score = dev_tau + dev_ndcg
+        dev_tau, dev_ndcg, dev_ndcg3, _ = evaluate(model, samples["dev"])
+        score = dev_tau + dev_ndcg + dev_ndcg3
         print(
             f"[EPOCH {epoch}] train_loss={total_loss/max(1,len(samples['train'])):.6f} "
-            f"dev_tau={dev_tau:.4f} dev_ndcg5={dev_ndcg:.4f}"
+            f"dev_tau={dev_tau:.4f} dev_ndcg5={dev_ndcg:.4f} dev_ndcg3={dev_ndcg3:.4f}"
         )
 
         if score > best_score:
@@ -448,14 +453,18 @@ def main() -> None:
         model.load_state_dict(best_state)
     print(f"[INFO] best_epoch={best_epoch} best_dev_score={best_score:.6f}")
 
-    test_tau, test_ndcg, test_rows = evaluate(model, samples["test"])
-    print(f"[RESULT] test_kendall_tau={test_tau:.6f} test_ndcg@5={test_ndcg:.6f}")
+    test_tau, test_ndcg, test_ndcg3, test_rows = evaluate(model, samples["test"])
+    print(
+        f"[RESULT] test_kendall_tau={test_tau:.6f} "
+        f"test_ndcg@5={test_ndcg:.6f} test_ndcg@3={test_ndcg3:.6f}"
+    )
 
     metrics = {
         "best_epoch": best_epoch,
         "best_dev_score": best_score,
         "test_kendall_tau": test_tau,
         "test_ndcg_at_5": test_ndcg,
+        "test_ndcg_at_3": test_ndcg3,
         "num_test_samples": len(samples["test"]),
     }
     metrics_json.parent.mkdir(parents=True, exist_ok=True)

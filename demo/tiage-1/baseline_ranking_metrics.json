@@ -1,0 +1,26 @@
+{
+  "lambda_c": 0.6,
+  "rows": [
+    {
+      "Method": "Centrality Only",
+      "Kendall Tau": -0.006280193236714982,
+      "NDCG@5": 0.21607498247669624,
+      "NDCG@3": 0.1746634017796959,
+      "Count": 92
+    },
+    {
+      "Method": "Relevance Only",
+      "Kendall Tau": 0.007971014492753623,
+      "NDCG@5": 0.22434710629029986,
+      "NDCG@3": 0.1846668221940349,
+      "Count": 92
+    },
+    {
+      "Method": "Centrality + Relevance",
+      "Kendall Tau": -0.014492753623188408,
+      "NDCG@5": 0.20256796283613385,
+      "NDCG@3": 0.11090137939259546,
+      "Count": 92
+    }
+  ]
+}

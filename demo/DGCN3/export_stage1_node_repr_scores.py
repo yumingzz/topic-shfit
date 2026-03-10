@@ -96,9 +96,12 @@ def main() -> None:
     parser.add_argument("--model_path", type=str, default="demo/DGCN3/model_registry/node_importance_tiage.pkl")
     parser.add_argument("--output_json", type=str, default="demo/tiage-1/stage1_node_repr_scores_selected.json")
 
-    parser.add_argument("--train_range", type=str, default="101-200")
-    parser.add_argument("--dev_range", type=str, default="1-50")
-    parser.add_argument("--test_range", type=str, default="1-50")
+    # parser.add_argument("--train_range", type=str, default="101-200")
+    # parser.add_argument("--dev_range", type=str, default="1-50")
+    # parser.add_argument("--test_range", type=str, default="1-50")
+    parser.add_argument("--train_range", type=str, default="1-300")
+    parser.add_argument("--dev_range", type=str, default="1-100")
+    parser.add_argument("--test_range", type=str, default="1-100")
 
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--output_dim", type=int, default=256)
