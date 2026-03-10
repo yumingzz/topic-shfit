@@ -1,8 +1,10 @@
 {
-  "best_epoch": 4,
-  "best_dev_score": 2.3704225411542126,
-  "test_kendall_tau": 0.5130227001194749,
-  "test_ndcg_at_5": 0.9005911180223677,
-  "test_ndcg_at_3": 0.8769064460602557,
+  "best_epoch": 9,
+  "best_dev_score": 1.6227996767470079,
+  "target_mode": "llm_or_weak",
+  "llm_rerank_json": "D:\\lesson\\Postgraduate\\EXcode\\Topic\\topic\\text-to-text-transfer-transformer-main\\demo\\tiage-1\\step2_reranked_annotation.json",
+  "test_kendall_tau": 0.192831541218638,
+  "test_ndcg_at_5": 0.7283211688540309,
+  "test_ndcg_at_3": 0.6968829169832977,
   "num_test_samples": 93
 }

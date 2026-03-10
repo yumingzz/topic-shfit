@@ -55,6 +55,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--with_relevance", action="store_true")
     parser.add_argument("--with_shift_label", action="store_true")
     parser.add_argument("--response_format_json", action="store_true")
+    parser.add_argument(
+        "--force_rank_scores",
+        action="store_true",
+        default=True,
+        help="Force scores to be strictly decreasing by reranked_nodes order.",
+    )
     return parser.parse_args()
 
 
@@ -174,7 +180,12 @@ def call_chat_completions(
     raise RuntimeError(f"API request failed after {max_retries} retries: {last_err}")
 
 
-def normalize_and_validate(model_out: dict, candidate_nodes: List[str], top_n: int) -> Tuple[dict, bool, str]:
+def normalize_and_validate(
+    model_out: dict,
+    candidate_nodes: List[str],
+    top_n: int,
+    force_rank_scores: bool = True,
+) -> Tuple[dict, bool, str]:
     expected = candidate_nodes[:]
     expected_set = set(expected)
 
@@ -212,9 +223,16 @@ def normalize_and_validate(model_out: dict, candidate_nodes: List[str], top_n: i
         for i, n in enumerate(reranked):
             score_map.setdefault(n, base - i)
 
+    if force_rank_scores:
+        # Enforce strict monotonicity: later rank => lower score.
+        n = len(reranked)
+        normalized_scores = [{"node": node, "score": float(n - i)} for i, node in enumerate(reranked)]
+    else:
+        normalized_scores = [{"node": n, "score": score_map[n]} for n in reranked]
+
     normalized = {
         "reranked_nodes": reranked,
-        "scores": [{"node": n, "score": score_map[n]} for n in reranked],
+        "scores": normalized_scores,
         "top_k": reranked[: max(1, min(top_n, len(reranked)))],
         "reason": str(model_out.get("reason", "")).strip(),
     }
@@ -237,7 +255,12 @@ def rerank_one(sample: dict, args: argparse.Namespace, model: str) -> dict:
     )
     content = raw_resp["choices"][0]["message"]["content"]
     model_out = json.loads(_extract_json_str(content))
-    norm, valid, status = normalize_and_validate(model_out, candidate_nodes, args.top_n)
+    norm, valid, status = normalize_and_validate(
+        model_out,
+        candidate_nodes,
+        args.top_n,
+        force_rank_scores=args.force_rank_scores,
+    )
 
     out = dict(sample)
     out["llm_rerank"] = norm

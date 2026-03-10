@@ -148,6 +148,26 @@ def build_stage2_map(stage2_json: Path) -> Dict[Tuple[str, int, int, int], dict]
     return m
 
 
+def build_llm_map(llm_json: Path) -> Dict[Tuple[str, int, int, int], dict]:
+    data = json.load(llm_json.open("r", encoding="utf-8"))
+    m: Dict[Tuple[str, int, int, int], dict] = {}
+    for split in ("train", "dev", "test"):
+        for r in data.get("splits", {}).get(split, []):
+            key = (split, int(r["dialog_id"]), int(r["turn_id"]), int(r["node_id"]))
+            llm = r.get("llm_rerank", {})
+            if not llm:
+                continue
+            score_map: Dict[str, float] = {}
+            for s in llm.get("scores", []):
+                try:
+                    score_map[str(s.get("node"))] = float(s.get("score"))
+                except (TypeError, ValueError):
+                    continue
+            rank_nodes = [str(x) for x in llm.get("reranked_nodes", [])]
+            m[key] = {"score_map": score_map, "rank_nodes": rank_nodes}
+    return m
+
+
 class MPNN(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int) -> None:
         super().__init__()
@@ -251,9 +271,11 @@ def pairwise_ranking_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Ten
 def build_samples(
     step1_json: Path,
     stage2_map: Dict[Tuple[str, int, int, int], dict],
+    llm_map: Dict[Tuple[str, int, int, int], dict],
     node_slice: Dict[int, int],
     slice_embeds: Dict[int, torch.Tensor],
     device: torch.device,
+    target_mode: str = "llm_or_weak",
 ) -> Dict[str, List[dict]]:
     data = json.load(step1_json.open("r", encoding="utf-8"))
     out = {"train": [], "dev": [], "test": []}
@@ -276,14 +298,52 @@ def build_samples(
             base_c = [float(c.get("centrality", 0.0)) for c in candidates]
             texts = [str(c.get("text", "")) for c in candidates]
 
-            # Build target ranking signal (weak supervision):
-            # combine base centrality and context-conditioned semantic relevance.
+            c_norm = minmax_norm(base_c)
+
+            # Weak target fallback: combine centrality + context-conditioned relevance.
             query = response if shift_label == 1 else " ".join(context)
             rel = cosine_tfidf(query, texts)
-            c_norm = minmax_norm(base_c)
             r_norm = minmax_norm(rel)
             alpha = 0.35 if shift_label == 1 else 0.65
-            target = [alpha * c + (1.0 - alpha) * r for c, r in zip(c_norm, r_norm)]
+            weak_target = [alpha * c + (1.0 - alpha) * r for c, r in zip(c_norm, r_norm)]
+
+            llm_target: List[float] = []
+            llm_entry = llm_map.get(key)
+            if llm_entry is not None:
+                score_map = llm_entry.get("score_map", {})
+                rank_nodes = llm_entry.get("rank_nodes", [])
+                # Use explicit llm scores first.
+                if score_map:
+                    for nid in node_ids:
+                        llm_target.append(float(score_map.get(str(nid), float("nan"))))
+                # If scores missing, derive from reranked order.
+                if (not llm_target) or any(math.isnan(x) for x in llm_target):
+                    llm_target = []
+                    rank_pos = {n: i for i, n in enumerate(rank_nodes)}
+                    max_rank = max(1, len(rank_nodes))
+                    for nid in node_ids:
+                        pos = rank_pos.get(str(nid), max_rank)
+                        llm_target.append(float(max_rank - pos))
+
+            llm_target_valid = bool(llm_target) and any(x != llm_target[0] for x in llm_target)
+            if llm_target_valid:
+                llm_target = minmax_norm(llm_target)
+
+            if target_mode == "llm_only":
+                if not llm_target_valid:
+                    continue
+                target = llm_target
+                target_source = "llm"
+            elif target_mode == "weak_only":
+                target = weak_target
+                target_source = "weak"
+            else:
+                if llm_target_valid:
+                    target = llm_target
+                    target_source = "llm"
+                else:
+                    target = weak_target
+                    target_source = "weak"
 
             node_repr_rows: List[torch.Tensor] = []
             for nid in node_ids:
@@ -305,6 +365,7 @@ def build_samples(
                 "node_repr": torch.stack(node_repr_rows, dim=0),  # [K, 256]
                 "base_c": torch.tensor(c_norm, dtype=torch.float, device=device),  # normalized scalar
                 "target": torch.tensor(target, dtype=torch.float, device=device),
+                "target_source": target_source,
                 "h_t": h_t,
                 "p_shift": p_shift,
             }
@@ -356,6 +417,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Stage-3 reranking with Attention + MLP and pairwise ranking loss.")
     parser.add_argument("--step1_json", type=str, default="demo/tiage-1/step1_candidates_top10.json")
     parser.add_argument("--stage2_json", type=str, default="demo/tiage-1/stage2_shift_features_selected.json")
+    parser.add_argument("--llm_rerank_json", type=str, default="demo/tiage-1/step2_reranked_annotation.json")
+    parser.add_argument(
+        "--target_mode",
+        type=str,
+        default="llm_or_weak",
+        choices=["llm_or_weak", "llm_only", "weak_only"],
+    )
     parser.add_argument("--centrality_dir", type=str, default="demo/DGCN3/Centrality/alpha_1.5")
     parser.add_argument("--processed_dir", type=str, default="demo/DGCN3/datasets/processed_data/tiage")
     parser.add_argument("--stage1_model_path", type=str, default="demo/DGCN3/model_registry/node_importance_tiage.pkl")
@@ -378,6 +446,7 @@ def main() -> None:
     root = Path(".").resolve()
     step1_json = (root / args.step1_json).resolve()
     stage2_json = (root / args.stage2_json).resolve()
+    llm_rerank_json = (root / args.llm_rerank_json).resolve()
     centrality_dir = (root / args.centrality_dir).resolve()
     processed_dir = (root / args.processed_dir).resolve()
     stage1_model_path = (root / args.stage1_model_path).resolve()
@@ -406,10 +475,23 @@ def main() -> None:
             slice_embeds[sid] = z
 
     stage2_map = build_stage2_map(stage2_json)
-    samples = build_samples(step1_json, stage2_map, node_slice, slice_embeds, device)
+    llm_map = build_llm_map(llm_rerank_json) if llm_rerank_json.exists() else {}
+    samples = build_samples(
+        step1_json,
+        stage2_map,
+        llm_map,
+        node_slice,
+        slice_embeds,
+        device,
+        target_mode=args.target_mode,
+    )
     print(
         f"[INFO] samples train={len(samples['train'])} dev={len(samples['dev'])} test={len(samples['test'])}"
     )
+    for split in ("train", "dev", "test"):
+        llm_n = sum(1 for s in samples[split] if s.get("target_source") == "llm")
+        weak_n = len(samples[split]) - llm_n
+        print(f"[INFO] {split} target_source llm={llm_n} weak={weak_n}")
 
     model = Stage3Reranker(node_dim=args.output_dim_stage1, ctx_dim=768, hidden_dim=args.stage3_hidden_dim).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -462,6 +544,8 @@ def main() -> None:
     metrics = {
         "best_epoch": best_epoch,
         "best_dev_score": best_score,
+        "target_mode": args.target_mode,
+        "llm_rerank_json": str(llm_rerank_json),
         "test_kendall_tau": test_tau,
         "test_ndcg_at_5": test_ndcg,
         "test_ndcg_at_3": test_ndcg3,

@@ -127,9 +127,37 @@ def load_snapshot_y(processed_dir: Path, device: torch.device) -> Dict[int, torc
     return y_map
 
 
+def build_llm_map(llm_json: Path) -> Dict[Tuple[str, int, int, int], dict]:
+    data = json.load(llm_json.open("r", encoding="utf-8"))
+    m: Dict[Tuple[str, int, int, int], dict] = {}
+    for split in ("train", "dev", "test"):
+        for r in data.get("splits", {}).get(split, []):
+            key = (split, int(r["dialog_id"]), int(r["turn_id"]), int(r["node_id"]))
+            llm = r.get("llm_rerank", {})
+            if not llm:
+                continue
+            score_map: Dict[str, float] = {}
+            for s in llm.get("scores", []):
+                try:
+                    score_map[str(s.get("node"))] = float(s.get("score"))
+                except (TypeError, ValueError):
+                    continue
+            rank_nodes = [str(x) for x in llm.get("reranked_nodes", [])]
+            m[key] = {"score_map": score_map, "rank_nodes": rank_nodes}
+    return m
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compute baseline ranking metrics on test samples.")
     parser.add_argument("--step1_json", type=str, default="demo/tiage-1/step1_candidates_top10.json")
+    parser.add_argument("--llm_rerank_json", type=str, default="demo/tiage-1/step2_reranked_annotation.json")
+    parser.add_argument(
+        "--target_mode",
+        type=str,
+        default="llm_or_weak",
+        choices=["llm_or_weak", "llm_only", "weak_only"],
+        help="Ground-truth target mode for metric evaluation.",
+    )
     parser.add_argument("--centrality_dir", type=str, default="demo/DGCN3/Centrality/alpha_1.5")
     parser.add_argument("--processed_dir", type=str, default="demo/DGCN3/datasets/processed_data/tiage")
     parser.add_argument("--lambda_c", type=float, default=0.6)
@@ -139,6 +167,7 @@ def main() -> None:
 
     root = Path(".").resolve()
     step1_json = (root / args.step1_json).resolve()
+    llm_rerank_json = (root / args.llm_rerank_json).resolve()
     centrality_dir = (root / args.centrality_dir).resolve()
     processed_dir = (root / args.processed_dir).resolve()
     metrics_json = (root / args.metrics_json).resolve()
@@ -148,6 +177,7 @@ def main() -> None:
     node_slice = load_node_slice_map(centrality_dir)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     y_map = load_snapshot_y(processed_dir, device)
+    llm_map = build_llm_map(llm_rerank_json) if llm_rerank_json.exists() else {}
 
     # If step1 has config lambda, use it unless overridden explicitly.
     if "config" in data and "lambda_c" in data["config"]:
@@ -161,6 +191,7 @@ def main() -> None:
         m: {"tau": [], "ndcg5": [], "ndcg3": [], "count": 0}
         for m in methods
     }
+    target_source_counter = {"llm": 0, "weak": 0}
 
     test_samples = data.get("splits", {}).get("test", [])
     for s in test_samples:
@@ -192,6 +223,43 @@ def main() -> None:
         r_norm = minmax_norm(rel)
         combo = [lambda_c * c + (1.0 - lambda_c) * r for c, r in zip(c_norm, r_norm)]
 
+        # Build evaluation target according to requested mode:
+        # llm_or_weak: use llm target if available else weak target
+        # llm_only: use llm target only
+        # weak_only: use weak target only
+        weak_target = combo
+        key = (str(s.get("split", "test")), int(s["dialog_id"]), int(s["turn_id"]), int(s["node_id"]))
+        llm_entry = llm_map.get(key)
+        llm_target: List[float] = []
+        if llm_entry is not None:
+            score_map = llm_entry.get("score_map", {})
+            rank_nodes = llm_entry.get("rank_nodes", [])
+            if score_map:
+                llm_target = [float(score_map.get(str(n), float("nan"))) for n in node_ids]
+            if (not llm_target) or any(math.isnan(x) for x in llm_target):
+                rank_pos = {n: i for i, n in enumerate(rank_nodes)}
+                max_rank = max(1, len(rank_nodes))
+                llm_target = [float(max_rank - rank_pos.get(str(n), max_rank)) for n in node_ids]
+        llm_target_valid = bool(llm_target) and any(x != llm_target[0] for x in llm_target)
+        if llm_target_valid:
+            llm_target = minmax_norm(llm_target)
+
+        if args.target_mode == "llm_only":
+            if not llm_target_valid:
+                continue
+            y_true = llm_target
+            target_source_counter["llm"] += 1
+        elif args.target_mode == "weak_only":
+            y_true = weak_target
+            target_source_counter["weak"] += 1
+        else:
+            if llm_target_valid:
+                y_true = llm_target
+                target_source_counter["llm"] += 1
+            else:
+                y_true = weak_target
+                target_source_counter["weak"] += 1
+
         pred_map = {
             "Centrality Only": c_norm,
             "Relevance Only": r_norm,
@@ -218,7 +286,18 @@ def main() -> None:
 
     metrics_json.parent.mkdir(parents=True, exist_ok=True)
     with metrics_json.open("w", encoding="utf-8") as f:
-        json.dump({"lambda_c": lambda_c, "rows": result_rows}, f, ensure_ascii=False, indent=2)
+        json.dump(
+            {
+                "lambda_c": lambda_c,
+                "target_mode": args.target_mode,
+                "llm_rerank_json": str(llm_rerank_json),
+                "target_source_count": target_source_counter,
+                "rows": result_rows,
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
 
     with metrics_csv.open("w", encoding="utf-8", newline="") as f:
         f.write("Method,Kendall Tau,NDCG@5,NDCG@3,Count\n")
@@ -234,6 +313,7 @@ def main() -> None:
             f"{r['Method']}: Kendall Tau={r['Kendall Tau']:.6f}, "
             f"NDCG@5={r['NDCG@5']:.6f}, NDCG@3={r['NDCG@3']:.6f}, Count={r['Count']}"
         )
+    print(f"target_source_count: llm={target_source_counter['llm']} weak={target_source_counter['weak']}")
 
 
 if __name__ == "__main__":

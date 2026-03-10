@@ -264,9 +264,12 @@ def main() -> None:
     parser.add_argument("--channelmix_hidden_mult", type=int, default=4)
     parser.add_argument("--channelmix_dropout", type=float, default=0.1)
 
-    parser.add_argument("--train_range", type=str, default="101-200")
-    parser.add_argument("--dev_range", type=str, default="1-50")
-    parser.add_argument("--test_range", type=str, default="1-50")
+    # parser.add_argument("--train_range", type=str, default="101-200")
+    # parser.add_argument("--dev_range", type=str, default="1-50")
+    # parser.add_argument("--test_range", type=str, default="1-50")
+    parser.add_argument("--train_range", type=str, default="1-300")
+    parser.add_argument("--dev_range", type=str, default="1-100")
+    parser.add_argument("--test_range", type=str, default="1-100")
     args = parser.parse_args()
 
     root = Path(".").resolve()

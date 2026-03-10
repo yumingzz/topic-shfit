@@ -1,25 +1,31 @@
 {
   "lambda_c": 0.6,
+  "target_mode": "llm_or_weak",
+  "llm_rerank_json": "D:\\lesson\\Postgraduate\\EXcode\\Topic\\topic\\text-to-text-transfer-transformer-main\\demo\\tiage-1\\step2_reranked_annotation.json",
+  "target_source_count": {
+    "llm": 92,
+    "weak": 0
+  },
   "rows": [
     {
       "Method": "Centrality Only",
-      "Kendall Tau": -0.006280193236714982,
-      "NDCG@5": 0.21607498247669624,
-      "NDCG@3": 0.1746634017796959,
+      "Kendall Tau": -0.18454106280193236,
+      "NDCG@5": 0.5102396753675057,
+      "NDCG@3": 0.45085099382490845,
       "Count": 92
     },
     {
       "Method": "Relevance Only",
-      "Kendall Tau": 0.007971014492753623,
-      "NDCG@5": 0.22434710629029986,
-      "NDCG@3": 0.1846668221940349,
+      "Kendall Tau": 0.1553140096618358,
+      "NDCG@5": 0.7354131310183741,
+      "NDCG@3": 0.7183510249820632,
       "Count": 92
     },
     {
       "Method": "Centrality + Relevance",
-      "Kendall Tau": -0.014492753623188408,
-      "NDCG@5": 0.20256796283613385,
-      "NDCG@3": 0.11090137939259546,
+      "Kendall Tau": -0.07149758454106282,
+      "NDCG@5": 0.5947134790988902,
+      "NDCG@3": 0.5773998853465578,
       "Count": 92
     }
   ]
