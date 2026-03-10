@@ -1,10 +1,19 @@
 {
-  "best_epoch": 9,
-  "best_dev_score": 1.6227996767470079,
+  "best_epoch": 1,
+  "best_dev_score": 1.6187222513197903,
   "target_mode": "llm_or_weak",
   "llm_rerank_json": "D:\\lesson\\Postgraduate\\EXcode\\Topic\\topic\\text-to-text-transfer-transformer-main\\demo\\tiage-1\\step2_reranked_annotation.json",
-  "test_kendall_tau": 0.192831541218638,
-  "test_ndcg_at_5": 0.7283211688540309,
-  "test_ndcg_at_3": 0.6968829169832977,
+  "loss_weights": {
+    "lambda_pairwise": 1.0,
+    "lambda_listwise": 0.2,
+    "lambda_kd": 0.05,
+    "distill_temp": 2.0,
+    "use_hard_pairwise": true,
+    "hard_gamma": 2.0,
+    "hard_min_weight": 1.0
+  },
+  "test_kendall_tau": 0.20430107526881713,
+  "test_ndcg_at_5": 0.7279511103604174,
+  "test_ndcg_at_3": 0.7038199845893733,
   "num_test_samples": 93
 }

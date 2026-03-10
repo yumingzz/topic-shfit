@@ -220,39 +220,72 @@ class NodeImportanceModel(nn.Module):
 class Stage3Reranker(nn.Module):
     def __init__(self, node_dim: int, ctx_dim: int, hidden_dim: int = 256):
         super().__init__()
+        self.node_proj = nn.Linear(node_dim, node_dim)
+        self.base_proj = nn.Linear(1, node_dim)
         self.ctx_proj = nn.Linear(ctx_dim, node_dim)
-        self.q_proj = nn.Linear(node_dim, node_dim)
-        self.k_proj = nn.Linear(node_dim, node_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(node_dim * 3 + 2, hidden_dim),
+        self.p_proj = nn.Linear(1, node_dim)
+        self.shift_token = nn.Parameter(torch.zeros(node_dim))
+
+        self.cross_attn = nn.MultiheadAttention(embed_dim=node_dim, num_heads=4, batch_first=True, dropout=0.1)
+        self.self_attn_block = nn.TransformerEncoderLayer(
+            d_model=node_dim,
+            nhead=4,
+            dim_feedforward=hidden_dim * 2,
+            dropout=0.1,
+            batch_first=True,
+            activation="gelu",
+        )
+        self.ln0 = nn.LayerNorm(node_dim)
+        self.ln1 = nn.LayerNorm(node_dim)
+
+        # Rich relational head with global interaction.
+        self.rel_mlp = nn.Sequential(
+            nn.Linear(node_dim * 4 + 2, hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1),
         )
+        self.prior_head = nn.Linear(1, 1)
+        self.prior_gate = nn.Sequential(
+            nn.Linear(node_dim + 1, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1),
+        )
 
     def forward(self, node_repr: torch.Tensor, base_c: torch.Tensor, h_t: torch.Tensor, p_shift: torch.Tensor) -> torch.Tensor:
         # node_repr: [K, D], base_c: [K], h_t: [H], p_shift: scalar
+        k_num = node_repr.size(0)
+        p_scalar = torch.tensor([[float(p_shift)]], device=node_repr.device)
+
+        # Candidate initialization.
+        x = self.node_proj(node_repr) + self.base_proj(base_c.unsqueeze(-1)) + self.p_proj(p_scalar).expand(k_num, -1)
+        x = self.ln0(x)
+
+        # Build memory tokens: context token + shift token.
         ctx = self.ctx_proj(h_t.unsqueeze(0)).squeeze(0)  # [D]
-        q = self.q_proj(ctx)  # [D]
-        k = self.k_proj(node_repr)  # [K, D]
-        attn = (k * q.unsqueeze(0)).sum(dim=-1) / math.sqrt(node_repr.size(-1))  # [K]
+        shift_tok = self.shift_token + self.p_proj(p_scalar).squeeze(0)
+        mem = torch.stack([ctx, shift_tok], dim=0).unsqueeze(0)  # [1, 2, D]
 
-        ctx_expand = ctx.unsqueeze(0).expand_as(node_repr)  # [K, D]
-        p_expand = torch.full((node_repr.size(0), 1), float(p_shift), device=node_repr.device)
-        feat = torch.cat(
-            [
-                node_repr,
-                ctx_expand,
-                node_repr * ctx_expand,
-                base_c.unsqueeze(-1),
-                p_expand,
-            ],
-            dim=-1,
-        )  # [K, 3D+2]
+        # Cross-attention: candidates query context/shift tokens.
+        x_b = x.unsqueeze(0)  # [1, K, D]
+        cross_out, _ = self.cross_attn(query=x_b, key=mem, value=mem)
+        x = self.ln1((x_b + cross_out).squeeze(0))
 
-        score = self.mlp(feat).squeeze(-1) + attn
+        # Candidate self-attention.
+        x = self.self_attn_block(x.unsqueeze(0)).squeeze(0)  # [K, D]
+
+        # Global relation feature.
+        g = x.mean(dim=0, keepdim=True).expand(k_num, -1)  # [K, D]
+        p_expand = torch.full((k_num, 1), float(p_shift), device=node_repr.device)
+        rel_feat = torch.cat([x, g, x * g, torch.abs(x - g), base_c.unsqueeze(-1), p_expand], dim=-1)
+        residual_score = self.rel_mlp(rel_feat).squeeze(-1)
+
+        prior_score = self.prior_head(base_c.unsqueeze(-1)).squeeze(-1)
+        gate_in = torch.cat([ctx, p_scalar.squeeze(0)], dim=0)
+        gate = torch.sigmoid(self.prior_gate(gate_in.unsqueeze(0))).squeeze(0).squeeze(0)
+        score = residual_score + gate * prior_score
         return score
 
 
@@ -266,6 +299,52 @@ def pairwise_ranking_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Ten
     diff_p = pred.unsqueeze(1) - pred.unsqueeze(0)
     loss = F.softplus(-sign * diff_p)
     return loss[valid].mean()
+
+
+def pairwise_ranking_loss_hard(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    hard_gamma: float = 2.0,
+    min_weight: float = 1.0,
+) -> torch.Tensor:
+    """
+    Hard-pair weighted pairwise ranking loss.
+    Pairs with smaller |pred_i - pred_j| are treated as harder and get larger weights.
+    """
+    diff_t = target.unsqueeze(1) - target.unsqueeze(0)
+    sign = torch.sign(diff_t)
+    valid = sign != 0
+    if valid.sum() == 0:
+        return pred.new_tensor(0.0)
+
+    diff_p = pred.unsqueeze(1) - pred.unsqueeze(0)
+    base = F.softplus(-sign * diff_p)
+
+    # Hardness: closer predicted scores => harder => larger weight.
+    with torch.no_grad():
+        hardness = torch.exp(-torch.abs(diff_p.detach()))
+        weights = min_weight + hard_gamma * hardness
+
+    weighted = base * weights
+    return weighted[valid].mean()
+
+
+def listwise_listmle_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    # ListMLE: maximize likelihood of target-induced permutation.
+    order = torch.argsort(target, descending=True)
+    s = pred[order]
+    loss = pred.new_tensor(0.0)
+    n = s.size(0)
+    for i in range(n):
+        loss = loss + (torch.logsumexp(s[i:], dim=0) - s[i])
+    return loss / max(1, n)
+
+
+def distill_kl_loss(pred: torch.Tensor, teacher_dist: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    # KL(teacher || student) on softened student probabilities.
+    log_student = F.log_softmax(pred / temperature, dim=0)
+    loss = F.kl_div(log_student, teacher_dist, reduction="batchmean", log_target=False)
+    return loss * (temperature ** 2)
 
 
 def build_samples(
@@ -345,6 +424,15 @@ def build_samples(
                     target = weak_target
                     target_source = "weak"
 
+            # Build target distributions for listwise / distillation losses.
+            target_tensor_tmp = torch.tensor(target, dtype=torch.float, device=device)
+            target_dist = torch.softmax(target_tensor_tmp / 0.07, dim=0)
+
+            teacher_dist = None
+            if llm_target_valid:
+                llm_tensor_tmp = torch.tensor(llm_target, dtype=torch.float, device=device)
+                teacher_dist = torch.softmax(llm_tensor_tmp / 0.07, dim=0)
+
             node_repr_rows: List[torch.Tensor] = []
             for nid in node_ids:
                 sid = node_slice.get(nid, s.get("slice_id"))
@@ -365,6 +453,8 @@ def build_samples(
                 "node_repr": torch.stack(node_repr_rows, dim=0),  # [K, 256]
                 "base_c": torch.tensor(c_norm, dtype=torch.float, device=device),  # normalized scalar
                 "target": torch.tensor(target, dtype=torch.float, device=device),
+                "target_dist": target_dist,
+                "teacher_dist": teacher_dist,
                 "target_source": target_source,
                 "h_t": h_t,
                 "p_shift": p_shift,
@@ -437,6 +527,13 @@ def main() -> None:
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--patience", type=int, default=12)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--lambda_pairwise", type=float, default=1.0)
+    parser.add_argument("--lambda_listwise", type=float, default=0.2)
+    parser.add_argument("--lambda_kd", type=float, default=0.5)
+    parser.add_argument("--distill_temp", type=float, default=1.5)
+    parser.add_argument("--use_hard_pairwise", action="store_true", default=True)
+    parser.add_argument("--hard_gamma", type=float, default=2.0)
+    parser.add_argument("--hard_min_weight", type=float, default=1.0)
 
     parser.add_argument("--metrics_json", type=str, default="demo/tiage-1/stage3_test_metrics.json")
     parser.add_argument("--pred_json", type=str, default="demo/tiage-1/stage3_test_predictions.json")
@@ -505,18 +602,41 @@ def main() -> None:
         model.train()
         random.shuffle(samples["train"])
         total_loss = 0.0
+        total_pair = 0.0
+        total_list = 0.0
+        total_kd = 0.0
         for s in samples["train"]:
             pred = model(s["node_repr"], s["base_c"], s["h_t"], s["p_shift"])
-            loss = pairwise_ranking_loss(pred, s["target"])
+            if args.use_hard_pairwise:
+                l_pair = pairwise_ranking_loss_hard(
+                    pred,
+                    s["target"],
+                    hard_gamma=args.hard_gamma,
+                    min_weight=args.hard_min_weight,
+                )
+            else:
+                l_pair = pairwise_ranking_loss(pred, s["target"])
+            l_list = listwise_listmle_loss(pred, s["target"])
+            l_kd = pred.new_tensor(0.0)
+            if s.get("teacher_dist") is not None:
+                l_kd = distill_kl_loss(pred, s["teacher_dist"], temperature=args.distill_temp)
+
+            loss = args.lambda_pairwise * l_pair + args.lambda_listwise * l_list + args.lambda_kd * l_kd
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             total_loss += float(loss.item())
+            total_pair += float(l_pair.item())
+            total_list += float(l_list.item())
+            total_kd += float(l_kd.item())
 
         dev_tau, dev_ndcg, dev_ndcg3, _ = evaluate(model, samples["dev"])
         score = dev_tau + dev_ndcg + dev_ndcg3
         print(
             f"[EPOCH {epoch}] train_loss={total_loss/max(1,len(samples['train'])):.6f} "
+            f"pair={total_pair/max(1,len(samples['train'])):.6f} "
+            f"list={total_list/max(1,len(samples['train'])):.6f} "
+            f"kd={total_kd/max(1,len(samples['train'])):.6f} "
             f"dev_tau={dev_tau:.4f} dev_ndcg5={dev_ndcg:.4f} dev_ndcg3={dev_ndcg3:.4f}"
         )
 
@@ -546,6 +666,15 @@ def main() -> None:
         "best_dev_score": best_score,
         "target_mode": args.target_mode,
         "llm_rerank_json": str(llm_rerank_json),
+        "loss_weights": {
+            "lambda_pairwise": args.lambda_pairwise,
+            "lambda_listwise": args.lambda_listwise,
+            "lambda_kd": args.lambda_kd,
+            "distill_temp": args.distill_temp,
+            "use_hard_pairwise": bool(args.use_hard_pairwise),
+            "hard_gamma": args.hard_gamma,
+            "hard_min_weight": args.hard_min_weight,
+        },
         "test_kendall_tau": test_tau,
         "test_ndcg_at_5": test_ndcg,
         "test_ndcg_at_3": test_ndcg3,

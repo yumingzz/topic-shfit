@@ -1,16 +1,14 @@
 import argparse
 import csv
-import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-import networkx as nx
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, T5EncoderModel, get_linear_schedule_with_warmup
 
 
@@ -49,10 +47,8 @@ def parse_nodes(nodes_csv: Path) -> List[dict]:
     return rows
 
 
-def load_centrality(centrality_dir: Path, num_slices: int) -> Tuple[Dict[int, float], Dict[int, int]]:
+def load_centrality(centrality_dir: Path, num_slices: int) -> Dict[int, float]:
     centrality: Dict[int, float] = {}
-    node_slice: Dict[int, int] = {}
-
     for sid in range(num_slices):
         path = centrality_dir / f"tiage_{sid}.csv"
         if not path.exists():
@@ -63,86 +59,16 @@ def load_centrality(centrality_dir: Path, num_slices: int) -> Tuple[Dict[int, fl
                 if not line:
                     continue
                 node_str, val_str = line.split(",", 1)
-                node_id = int(node_str)
-                val = float(val_str)
-                centrality[node_id] = val
-                node_slice[node_id] = sid
-    return centrality, node_slice
+                centrality[int(node_str)] = float(val_str)
+    return centrality
 
 
-def load_slice_graph(graph_path: Path, nodes: List[int]) -> nx.Graph:
-    g = nx.Graph()
-    g.add_nodes_from(nodes)
-    if graph_path.exists():
-        with graph_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                u_str, v_str = line.split()
-                g.add_edge(int(u_str), int(v_str))
-    return g
-
-
-def compute_louvain_feature(
-    slices_txt_dir: Path,
-    node_slice: Dict[int, int],
-    num_slices: int,
-    seed: int,
-) -> Tuple[Dict[int, float], Dict[int, float]]:
-    community_ratio: Dict[int, float] = {}
-    bridge_ratio: Dict[int, float] = {}
-
-    for sid in range(num_slices):
-        nodes = [nid for nid, s in node_slice.items() if s == sid]
-        if not nodes:
-            continue
-
-        g = load_slice_graph(slices_txt_dir / f"tiage_{sid}.txt", nodes)
-        if g.number_of_nodes() == 0:
-            continue
-
-        try:
-            communities = nx.community.louvain_communities(g, seed=seed)
-        except Exception:
-            communities = list(nx.community.greedy_modularity_communities(g))
-
-        total = float(g.number_of_nodes())
-        for comm in communities:
-            ratio = len(comm) / total
-            for nid in comm:
-                community_ratio[int(nid)] = ratio
-        node_to_comm: Dict[int, int] = {}
-        for ci, comm in enumerate(communities):
-            for nid in comm:
-                node_to_comm[int(nid)] = ci
-        eps = 1e-8
-        for nid in g.nodes():
-            deg_in = 0
-            deg_out = 0
-            c_nid = node_to_comm.get(int(nid), -1)
-            for nb in g.neighbors(nid):
-                if node_to_comm.get(int(nb), -2) == c_nid:
-                    deg_in += 1
-                else:
-                    deg_out += 1
-            deg_all = deg_in + deg_out
-            bridge_ratio[int(nid)] = float(deg_out) / float(deg_all + eps)
-
-    return community_ratio, bridge_ratio
-
-
-def build_samples(
-    rows: List[dict],
-    centrality: Dict[int, float],
-    context_turns: int,
-) -> Dict[str, List[Sample]]:
+def build_samples(rows: List[dict], centrality: Dict[int, float], context_turns: int) -> Dict[str, List[Sample]]:
     by_dialog: Dict[Tuple[str, int], List[dict]] = {}
     for r in rows:
         by_dialog.setdefault((r["split"], r["dialog_id"]), []).append(r)
 
     result: Dict[str, List[Sample]] = {"train": [], "dev": [], "test": []}
-
     for (split, _dialog_id), turns in by_dialog.items():
         turns = sorted(turns, key=lambda x: x["turn_id"])
         for i, cur in enumerate(turns):
@@ -160,11 +86,10 @@ def build_samples(
                 ctx_parts.append(f"{h['text']} [CEN={h_c:.4f}]")
 
             cur_c = centrality.get(cur["node_id"], 0.0)
-
             context_text = " </s> ".join(ctx_parts) if ctx_parts else "<no_context>"
             text = (
-                f"task: topic shift detection\\n"
-                f"context: {context_text}\\n"
+                f"task: topic shift detection\n"
+                f"context: {context_text}\n"
                 f"response: {cur['text']} [CEN={cur_c:.4f}]"
             )
 
@@ -179,7 +104,6 @@ def build_samples(
             )
             if split in result:
                 result[split].append(sample)
-
     return result
 
 
@@ -210,7 +134,6 @@ class Collator:
         )
         labels = torch.tensor([x.label for x in batch], dtype=torch.long)
         feats = torch.tensor([[x.centrality] for x in batch], dtype=torch.float)
-
         return {
             "input_ids": tok["input_ids"],
             "attention_mask": tok["attention_mask"],
@@ -235,67 +158,47 @@ class RWKVChannelMix(nn.Module):
         k = torch.relu(self.key(xx)) ** 2
         kv = self.value(k)
         r = torch.sigmoid(self.receptance(xx))
-        mixed = r * kv
-        return x + self.dropout(mixed)
+        return x + self.dropout(r * kv)
 
 
-class T5ShiftClassifier(nn.Module):
+class T5Baseline(nn.Module):
     def __init__(
         self,
-        model_name: str,
-        dropout: float = 0.1,
-        use_channelmix: bool = False,
+        model_name: str = "t5-base",
+        dropout: float = 0.2,
         channelmix_layers: int = 1,
         channelmix_hidden_mult: int = 4,
         channelmix_dropout: float = 0.1,
-        num_extra_features: int = 1,
     ):
         super().__init__()
         self.encoder = T5EncoderModel.from_pretrained(model_name)
         hidden = self.encoder.config.d_model
-        self.use_channelmix = use_channelmix
         self.channelmix_stack = nn.ModuleList(
-            [
-                RWKVChannelMix(
-                    hidden_size=hidden,
-                    hidden_mult=channelmix_hidden_mult,
-                    dropout=channelmix_dropout,
-                )
-                for _ in range(max(0, channelmix_layers))
-            ]
+            [RWKVChannelMix(hidden, hidden_mult=channelmix_hidden_mult, dropout=channelmix_dropout) for _ in range(max(0, channelmix_layers))]
         )
-        self.feature_norm = nn.LayerNorm(num_extra_features)
+        self.attn_pool = nn.Linear(hidden, 1)
+        self.feature_norm = nn.LayerNorm(1)
         self.classifier = nn.Sequential(
-            nn.Linear(hidden + num_extra_features, hidden),
+            nn.Linear(hidden + 1, hidden),
             nn.Tanh(),
             nn.Dropout(dropout),
             nn.Linear(hidden, 2),
         )
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        extra_features: torch.Tensor,
-        labels: torch.Tensor = None,
-        class_weights: torch.Tensor = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, extra_features: torch.Tensor, labels: torch.Tensor = None):
         out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
         hs = out.last_hidden_state
-        if self.use_channelmix:
-            for block in self.channelmix_stack:
-                hs = block(hs)
-        mask = attention_mask.unsqueeze(-1).float()
-        pooled = (hs * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
+        for block in self.channelmix_stack:
+            hs = block(hs)
+        attn_logits = self.attn_pool(hs).squeeze(-1)
+        attn_logits = attn_logits.masked_fill(attention_mask == 0, -1e9)
+        attn_weight = torch.softmax(attn_logits, dim=-1).unsqueeze(-1)
+        pooled = (hs * attn_weight).sum(dim=1)
         feats = self.feature_norm(extra_features)
         logits = self.classifier(torch.cat([pooled, feats], dim=-1))
-
         loss = None
         if labels is not None:
-            if class_weights is not None:
-                loss = F.cross_entropy(logits, labels, weight=class_weights.to(logits.device))
-            else:
-                loss = F.cross_entropy(logits, labels)
+            loss = F.cross_entropy(logits, labels)
         return loss, logits
 
 
@@ -303,25 +206,21 @@ def precision_recall_macro_f1(y_true: List[int], y_pred: List[int]) -> Tuple[flo
     p_list: List[float] = []
     r_list: List[float] = []
     f_list: List[float] = []
-
     for cls in (0, 1):
         tp = sum(1 for t, p in zip(y_true, y_pred) if t == cls and p == cls)
         fp = sum(1 for t, p in zip(y_true, y_pred) if t != cls and p == cls)
         fn = sum(1 for t, p in zip(y_true, y_pred) if t == cls and p != cls)
-
         p = tp / (tp + fp) if (tp + fp) else 0.0
         r = tp / (tp + fn) if (tp + fn) else 0.0
         f = (2 * p * r / (p + r)) if (p + r) else 0.0
-
         p_list.append(p)
         r_list.append(r)
         f_list.append(f)
-
     return sum(p_list) / 2.0, sum(r_list) / 2.0, sum(f_list) / 2.0
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, threshold: float = 0.5) -> Tuple[dict, List[dict]]:
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, threshold: float = 0.5):
     model.eval()
     y_true: List[int] = []
     y_pred: List[int] = []
@@ -332,20 +231,12 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, thresho
         attention_mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device)
         extra_features = batch["extra_features"].to(device)
-
-        _, logits = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            extra_features=extra_features,
-            labels=labels,
-        )
-
+        _, logits = model(input_ids, attention_mask, extra_features, labels)
         probs = torch.softmax(logits, dim=-1)
         pred = (probs[:, 1] >= threshold).long()
 
         y_true.extend(labels.cpu().tolist())
         y_pred.extend(pred.cpu().tolist())
-
         probs1 = probs[:, 1].cpu().tolist()
         for m, t, p, p1 in zip(batch["meta"], labels.cpu().tolist(), pred.cpu().tolist(), probs1):
             pred_rows.append(
@@ -363,74 +254,7 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, thresho
 
     precision, recall, macro_f1 = precision_recall_macro_f1(y_true, y_pred)
     acc = sum(1 for t, p in zip(y_true, y_pred) if t == p) / len(y_true)
-
-    return {
-        "precision": precision,
-        "recall": recall,
-        "macro_f1": macro_f1,
-        "accuracy": acc,
-        "size": len(y_true),
-    }, pred_rows
-
-
-@torch.no_grad()
-def find_best_threshold(
-    model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-    min_thr: float,
-    max_thr: float,
-    step: float,
-) -> float:
-    model.eval()
-    y_true: List[int] = []
-    prob_1: List[float] = []
-    for batch in loader:
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels = batch["labels"].to(device)
-        extra_features = batch["extra_features"].to(device)
-        _, logits = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            extra_features=extra_features,
-            labels=labels,
-        )
-        probs = torch.softmax(logits, dim=-1)[:, 1]
-        y_true.extend(labels.cpu().tolist())
-        prob_1.extend(probs.cpu().tolist())
-
-    best_thr = 0.5
-    best_f1 = -1.0
-    thr = min_thr
-    while thr <= max_thr + 1e-12:
-        y_pred = [1 if p >= thr else 0 for p in prob_1]
-        _, _, macro_f1 = precision_recall_macro_f1(y_true, y_pred)
-        if macro_f1 > best_f1:
-            best_f1 = macro_f1
-            best_thr = thr
-        thr += step
-    return float(best_thr)
-
-
-def compute_class_weights(train_samples: List[Sample]) -> torch.Tensor:
-    count0 = sum(1 for s in train_samples if s.label == 0)
-    count1 = sum(1 for s in train_samples if s.label == 1)
-    total = max(1, count0 + count1)
-    # inverse-frequency weights, normalized around 1.0 scale
-    w0 = total / max(1, 2 * count0)
-    w1 = total / max(1, 2 * count1)
-    return torch.tensor([w0, w1], dtype=torch.float)
-
-
-def build_oversample_sampler(train_samples: List[Sample]) -> WeightedRandomSampler:
-    # Inverse-frequency sampling to oversample label=1 in each epoch.
-    count0 = sum(1 for s in train_samples if s.label == 0)
-    count1 = sum(1 for s in train_samples if s.label == 1)
-    w0 = 1.0 / max(1, count0)
-    w1 = 1.0 / max(1, count1)
-    weights = [w1 if s.label == 1 else w0 for s in train_samples]
-    return WeightedRandomSampler(weights=weights, num_samples=len(train_samples), replacement=True)
+    return {"precision": precision, "recall": recall, "macro_f1": macro_f1, "accuracy": acc, "size": len(y_true)}, pred_rows
 
 
 def save_csv(path: Path, rows: List[dict], fieldnames: List[str]) -> None:
@@ -442,65 +266,48 @@ def save_csv(path: Path, rows: List[dict], fieldnames: List[str]) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="TIAGE topic shift detection with T5 (+ optional RWKV ChannelMix) + centrality + Louvain community")
+    parser = argparse.ArgumentParser(description="Best baseline: T5-base + centrality + ChannelMix (no oversample, no z-score)")
     parser.add_argument("--nodes_csv", type=str, default="demo/tiage-1/outputs_nodes/tiage_anno_nodes_all.csv")
     parser.add_argument("--centrality_dir", type=str, default="demo/DGCN3/Centrality/alpha_1.5")
-    parser.add_argument("--slices_txt_dir", type=str, default="demo/tiage-1/tiage_slices_txt")
-    parser.add_argument("--output_dir", type=str, default="demo/tiage-1/results_t5_topic_shift")
-    parser.add_argument("--model_name", type=str, default="t5-small")
+    parser.add_argument("--output_dir", type=str, default="demo/tiage-1/results_t5_base_channelmix")
+    parser.add_argument("--model_name", type=str, default="t5-base")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_length", type=int, default=384)
-    # parser.add_argument("--context_turns", type=int, default=16)
     parser.add_argument("--context_turns", type=int, default=5)
     parser.add_argument("--num_slices", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--classifier_dropout", type=float, default=0.1)
-    parser.add_argument("--use_channelmix", action="store_true", help="Enable RWKV ChannelMix blocks after T5 encoder.")
+    parser.add_argument("--classifier_dropout", type=float, default=0.2)
     parser.add_argument("--channelmix_layers", type=int, default=1)
     parser.add_argument("--channelmix_hidden_mult", type=int, default=4)
     parser.add_argument("--channelmix_dropout", type=float, default=0.1)
-    parser.add_argument("--no_class_weights", action="store_true", help="Disable class-weighted cross-entropy.")
-    parser.add_argument("--no_oversample_train", action="store_true", help="Disable training oversampling for label=1.")
-    parser.add_argument("--thr_min", type=float, default=0.30)
-    parser.add_argument("--thr_max", type=float, default=0.70)
-    parser.add_argument("--thr_step", type=float, default=0.01)
+    parser.add_argument("--fixed_threshold", type=float, default=0.5)
     args = parser.parse_args()
-    if args.use_channelmix and args.channelmix_layers < 1:
-        raise ValueError("--channelmix_layers must be >= 1 when --use_channelmix is enabled.")
 
     set_seed(args.seed)
-
     root = Path(".").resolve()
     nodes_csv = (root / args.nodes_csv).resolve()
     centrality_dir = (root / args.centrality_dir).resolve()
-    slices_txt_dir = (root / args.slices_txt_dir).resolve()
     output_dir = (root / args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[INFO] nodes_csv={nodes_csv}")
     print(f"[INFO] centrality_dir={centrality_dir}")
-    print(f"[INFO] slices_txt_dir={slices_txt_dir}")
     print(f"[INFO] output_dir={output_dir}")
-    print(
-        f"[INFO] model={args.model_name} use_channelmix={args.use_channelmix} "
-        f"channelmix_layers={args.channelmix_layers} max_length={args.max_length} "
-        f"context_turns={args.context_turns} batch_size={args.batch_size}"
-    )
+    print(f"[INFO] model={args.model_name} context_turns={args.context_turns} batch_size={args.batch_size}")
 
     rows = parse_nodes(nodes_csv)
-    centrality, node_slice = load_centrality(centrality_dir, args.num_slices)
+    centrality = load_centrality(centrality_dir, args.num_slices)
     split_samples = build_samples(rows, centrality, args.context_turns)
     for split in ("train", "dev", "test"):
         print(f"[INFO] {split} samples={len(split_samples[split])}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    model = T5ShiftClassifier(
+    model = T5Baseline(
         model_name=args.model_name,
         dropout=args.classifier_dropout,
-        use_channelmix=args.use_channelmix,
         channelmix_layers=args.channelmix_layers,
         channelmix_hidden_mult=args.channelmix_hidden_mult,
         channelmix_dropout=args.channelmix_dropout,
@@ -511,26 +318,10 @@ def main() -> None:
     print(f"[INFO] device={device}")
 
     collator = Collator(tokenizer, args.max_length)
-
-    train_dataset = TiageDataset(split_samples["train"])
-    dev_dataset = TiageDataset(split_samples["dev"])
-    test_dataset = TiageDataset(split_samples["test"])
-
-    train_sampler = None if args.no_oversample_train else build_oversample_sampler(split_samples["train"])
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=(train_sampler is None),
-        sampler=train_sampler,
-        collate_fn=collator,
-    )
-    train_eval_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collator)
-    dev_loader = DataLoader(dev_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collator)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collator)
-    class_weights = None if args.no_class_weights else compute_class_weights(split_samples["train"]).to(device)
-    if class_weights is not None:
-        print(f"[INFO] class_weights=[{class_weights[0].item():.4f}, {class_weights[1].item():.4f}]")
-    print(f"[INFO] oversample_train={not args.no_oversample_train}")
+    train_loader = DataLoader(TiageDataset(split_samples["train"]), batch_size=args.batch_size, shuffle=True, collate_fn=collator)
+    train_eval_loader = DataLoader(TiageDataset(split_samples["train"]), batch_size=args.batch_size, shuffle=False, collate_fn=collator)
+    dev_loader = DataLoader(TiageDataset(split_samples["dev"]), batch_size=args.batch_size, shuffle=False, collate_fn=collator)
+    test_loader = DataLoader(TiageDataset(split_samples["test"]), batch_size=args.batch_size, shuffle=False, collate_fn=collator)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     total_steps = len(train_loader) * args.epochs
@@ -541,70 +332,53 @@ def main() -> None:
     )
 
     best_dev = -1.0
+    best_score = -1.0
     best_epoch = 0
     best_path = output_dir / "best_model.pt"
-
     for epoch in range(1, args.epochs + 1):
         model.train()
         total_loss = 0.0
-
         for batch in train_loader:
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
             extra_features = batch["extra_features"].to(device)
 
-            loss, _ = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                extra_features=extra_features,
-                labels=labels,
-                class_weights=class_weights,
-            )
-
+            loss, _ = model(input_ids, attention_mask, extra_features, labels)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             scheduler.step()
-
             total_loss += loss.item()
 
-        dev_metrics, _ = evaluate(model, dev_loader, device, threshold=0.5)
+        dev_metrics, _ = evaluate(model, dev_loader, device, threshold=args.fixed_threshold)
         avg_loss = total_loss / max(1, len(train_loader))
         print(
             f"[EPOCH {epoch}] train_loss={avg_loss:.4f} "
             f"dev_P={dev_metrics['precision']:.4f} dev_R={dev_metrics['recall']:.4f} "
             f"dev_MacroF1={dev_metrics['macro_f1']:.4f}"
         )
-
-        if dev_metrics["macro_f1"] > best_dev:
+        current_score = dev_metrics["precision"] + dev_metrics["recall"] + dev_metrics["macro_f1"]
+        if current_score > best_score:
+            best_score = current_score
             best_dev = dev_metrics["macro_f1"]
             best_epoch = epoch
             torch.save(model.state_dict(), best_path)
 
-    print(f"[INFO] best dev Macro-F1={best_dev:.4f} at epoch={best_epoch}")
+    print(f"[INFO] best dev Macro-F1={best_dev:.4f} at epoch={best_epoch} (prf_sum={best_score:.4f})")
 
     model.load_state_dict(torch.load(best_path, map_location=device))
-    best_threshold = find_best_threshold(
-        model=model,
-        loader=dev_loader,
-        device=device,
-        min_thr=args.thr_min,
-        max_thr=args.thr_max,
-        step=args.thr_step,
-    )
-    print(f"[INFO] best_threshold_on_dev={best_threshold:.2f}")
+    print(f"[INFO] fixed_threshold={args.fixed_threshold:.2f}")
 
-    train_metrics, train_rows = evaluate(model, train_eval_loader, device, threshold=best_threshold)
-    dev_metrics, dev_rows = evaluate(model, dev_loader, device, threshold=best_threshold)
-    test_metrics, test_rows = evaluate(model, test_loader, device, threshold=best_threshold)
+    train_metrics, train_rows = evaluate(model, train_eval_loader, device, threshold=args.fixed_threshold)
+    dev_metrics, dev_rows = evaluate(model, dev_loader, device, threshold=args.fixed_threshold)
+    test_metrics, test_rows = evaluate(model, test_loader, device, threshold=args.fixed_threshold)
 
     metrics_rows = [
-        {"split": "train", "best_epoch": best_epoch, "best_threshold": best_threshold, "model_name": args.model_name, "use_channelmix": int(args.use_channelmix), **train_metrics},
-        {"split": "dev", "best_epoch": best_epoch, "best_threshold": best_threshold, "model_name": args.model_name, "use_channelmix": int(args.use_channelmix), **dev_metrics},
-        {"split": "test", "best_epoch": best_epoch, "best_threshold": best_threshold, "model_name": args.model_name, "use_channelmix": int(args.use_channelmix), **test_metrics},
+        {"split": "train", "best_epoch": best_epoch, "best_threshold": args.fixed_threshold, "model_name": args.model_name, "use_channelmix": 1, **train_metrics},
+        {"split": "dev", "best_epoch": best_epoch, "best_threshold": args.fixed_threshold, "model_name": args.model_name, "use_channelmix": 1, **dev_metrics},
+        {"split": "test", "best_epoch": best_epoch, "best_threshold": args.fixed_threshold, "model_name": args.model_name, "use_channelmix": 1, **test_metrics},
     ]
-
     save_csv(
         output_dir / "metrics.csv",
         metrics_rows,

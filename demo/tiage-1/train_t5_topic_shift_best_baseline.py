@@ -178,6 +178,7 @@ class T5Baseline(nn.Module):
         )
         self.attn_pool = nn.Linear(hidden, 1)
         self.feature_norm = nn.LayerNorm(1)
+        self.gate_proj = nn.Linear(hidden + 1, hidden)
         self.classifier = nn.Sequential(
             nn.Linear(hidden + 1, hidden),
             nn.Tanh(),
@@ -195,7 +196,9 @@ class T5Baseline(nn.Module):
         attn_weight = torch.softmax(attn_logits, dim=-1).unsqueeze(-1)
         pooled = (hs * attn_weight).sum(dim=1)
         feats = self.feature_norm(extra_features)
-        logits = self.classifier(torch.cat([pooled, feats], dim=-1))
+        gate = torch.sigmoid(self.gate_proj(torch.cat([pooled, feats], dim=-1)))
+        pooled_gated = pooled * gate + pooled
+        logits = self.classifier(torch.cat([pooled_gated, feats], dim=-1))
         loss = None
         if labels is not None:
             loss = F.cross_entropy(logits, labels)
@@ -276,7 +279,7 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_length", type=int, default=384)
-    parser.add_argument("--context_turns", type=int, default=16)
+    parser.add_argument("--context_turns", type=int, default=5)
     parser.add_argument("--num_slices", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--classifier_dropout", type=float, default=0.2)
