@@ -161,6 +161,36 @@ class RWKVChannelMix(nn.Module):
         return x + self.dropout(r * kv)
 
 
+class KANLayer(nn.Module):
+    def __init__(self, in_features: int, out_features: int, grid_size: int = 8, grid_range: float = 2.0):
+        super().__init__()
+        if grid_size < 2:
+            raise ValueError("grid_size must be >= 2")
+        self.in_features = in_features
+        self.out_features = out_features
+        self.grid_size = grid_size
+        self.grid_range = grid_range
+
+        self.norm = nn.LayerNorm(in_features)
+        self.base_linear = nn.Linear(in_features, out_features)
+        self.spline_weight = nn.Parameter(torch.empty(out_features, in_features, grid_size))
+        nn.init.xavier_uniform_(self.spline_weight)
+
+        grid = torch.linspace(-grid_range, grid_range, grid_size)
+        self.register_buffer("grid", grid, persistent=False)
+        self.inv_step = float(grid_size - 1) / (2.0 * grid_range)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_norm = self.norm(x)
+        base = self.base_linear(F.silu(x_norm))
+
+        # Gaussian RBF basis over fixed grid; used as spline-like nonlinear basis.
+        x_diff = (x_norm.unsqueeze(-1) - self.grid) * self.inv_step
+        basis = torch.exp(-(x_diff ** 2))
+        spline = torch.einsum("big,oig->bo", basis, self.spline_weight)
+        return base + spline
+
+
 class T5Baseline(nn.Module):
     def __init__(
         self,
@@ -169,22 +199,31 @@ class T5Baseline(nn.Module):
         channelmix_layers: int = 1,
         channelmix_hidden_mult: int = 4,
         channelmix_dropout: float = 0.1,
+        classifier_head: str = "mlp",
+        kan_grid_size: int = 4,
+        kan_grid_range: float = 1.5,
     ):
         super().__init__()
         self.encoder = T5EncoderModel.from_pretrained(model_name)
         hidden = self.encoder.config.d_model
+        if classifier_head not in ("mlp", "kan_last"):
+            raise ValueError("classifier_head must be one of: mlp, kan_last")
+        self.classifier_head = classifier_head
         self.channelmix_stack = nn.ModuleList(
             [RWKVChannelMix(hidden, hidden_mult=channelmix_hidden_mult, dropout=channelmix_dropout) for _ in range(max(0, channelmix_layers))]
         )
         self.attn_pool = nn.Linear(hidden, 1)
         self.feature_norm = nn.LayerNorm(1)
         self.gate_proj = nn.Linear(hidden + 1, hidden)
-        self.classifier = nn.Sequential(
+        self.classifier_proj = nn.Sequential(
             nn.Linear(hidden + 1, hidden),
             nn.Tanh(),
             nn.Dropout(dropout),
-            nn.Linear(hidden, 2),
         )
+        if classifier_head == "kan_last":
+            self.classifier_out = KANLayer(hidden, 2, grid_size=kan_grid_size, grid_range=kan_grid_range)
+        else:
+            self.classifier_out = nn.Linear(hidden, 2)
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, extra_features: torch.Tensor, labels: torch.Tensor = None):
         out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
@@ -198,7 +237,8 @@ class T5Baseline(nn.Module):
         feats = self.feature_norm(extra_features)
         gate = torch.sigmoid(self.gate_proj(torch.cat([pooled, feats], dim=-1)))
         pooled_gated = pooled * gate + pooled
-        logits = self.classifier(torch.cat([pooled_gated, feats], dim=-1))
+        head_hidden = self.classifier_proj(torch.cat([pooled_gated, feats], dim=-1))
+        logits = self.classifier_out(head_hidden)
         loss = None
         if labels is not None:
             loss = F.cross_entropy(logits, labels)
@@ -269,7 +309,7 @@ def save_csv(path: Path, rows: List[dict], fieldnames: List[str]) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Best baseline: T5-base + centrality + ChannelMix (no oversample, no z-score)")
+    parser = argparse.ArgumentParser(description="Best baseline: T5-base + centrality + ChannelMix + optional KAN-last classifier head")
     parser.add_argument("--nodes_csv", type=str, default="demo/tiage-1/outputs_nodes/tiage_anno_nodes_all.csv")
     parser.add_argument("--centrality_dir", type=str, default="demo/DGCN3/Centrality/alpha_1.5")
     parser.add_argument("--output_dir", type=str, default="demo/tiage-1/results_t5_base_channelmix_best_baseline")
@@ -286,6 +326,9 @@ def main() -> None:
     parser.add_argument("--channelmix_layers", type=int, default=1)
     parser.add_argument("--channelmix_hidden_mult", type=int, default=4)
     parser.add_argument("--channelmix_dropout", type=float, default=0.1)
+    parser.add_argument("--classifier_head", type=str, default="mlp", choices=["mlp", "kan_last"])
+    parser.add_argument("--kan_grid_size", type=int, default=4)
+    parser.add_argument("--kan_grid_range", type=float, default=1.5)
     parser.add_argument("--fixed_threshold", type=float, default=0.5)
     args = parser.parse_args()
 
@@ -299,7 +342,10 @@ def main() -> None:
     print(f"[INFO] nodes_csv={nodes_csv}")
     print(f"[INFO] centrality_dir={centrality_dir}")
     print(f"[INFO] output_dir={output_dir}")
-    print(f"[INFO] model={args.model_name} context_turns={args.context_turns} batch_size={args.batch_size}")
+    print(
+        f"[INFO] model={args.model_name} classifier_head={args.classifier_head} "
+        f"context_turns={args.context_turns} batch_size={args.batch_size}"
+    )
 
     rows = parse_nodes(nodes_csv)
     centrality = load_centrality(centrality_dir, args.num_slices)
@@ -314,6 +360,9 @@ def main() -> None:
         channelmix_layers=args.channelmix_layers,
         channelmix_hidden_mult=args.channelmix_hidden_mult,
         channelmix_dropout=args.channelmix_dropout,
+        classifier_head=args.classifier_head,
+        kan_grid_size=args.kan_grid_size,
+        kan_grid_range=args.kan_grid_range,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -378,14 +427,38 @@ def main() -> None:
     test_metrics, test_rows = evaluate(model, test_loader, device, threshold=args.fixed_threshold)
 
     metrics_rows = [
-        {"split": "train", "best_epoch": best_epoch, "best_threshold": args.fixed_threshold, "model_name": args.model_name, "use_channelmix": 1, **train_metrics},
-        {"split": "dev", "best_epoch": best_epoch, "best_threshold": args.fixed_threshold, "model_name": args.model_name, "use_channelmix": 1, **dev_metrics},
-        {"split": "test", "best_epoch": best_epoch, "best_threshold": args.fixed_threshold, "model_name": args.model_name, "use_channelmix": 1, **test_metrics},
+        {
+            "split": "train",
+            "best_epoch": best_epoch,
+            "best_threshold": args.fixed_threshold,
+            "model_name": args.model_name,
+            "use_channelmix": 1,
+            "classifier_head": args.classifier_head,
+            **train_metrics,
+        },
+        {
+            "split": "dev",
+            "best_epoch": best_epoch,
+            "best_threshold": args.fixed_threshold,
+            "model_name": args.model_name,
+            "use_channelmix": 1,
+            "classifier_head": args.classifier_head,
+            **dev_metrics,
+        },
+        {
+            "split": "test",
+            "best_epoch": best_epoch,
+            "best_threshold": args.fixed_threshold,
+            "model_name": args.model_name,
+            "use_channelmix": 1,
+            "classifier_head": args.classifier_head,
+            **test_metrics,
+        },
     ]
     save_csv(
         output_dir / "metrics.csv",
         metrics_rows,
-        ["split", "best_epoch", "best_threshold", "model_name", "use_channelmix", "precision", "recall", "macro_f1", "accuracy", "size"],
+        ["split", "best_epoch", "best_threshold", "model_name", "use_channelmix", "classifier_head", "precision", "recall", "macro_f1", "accuracy", "size"],
     )
     save_csv(
         output_dir / "predictions.csv",

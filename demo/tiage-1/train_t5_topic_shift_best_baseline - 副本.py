@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-import networkx as nx
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -22,8 +21,6 @@ class Sample:
     text: str
     label: int
     centrality: float
-    community_ratio: float
-    bridge_ratio: float
 
 
 def set_seed(seed: int) -> None:
@@ -50,9 +47,8 @@ def parse_nodes(nodes_csv: Path) -> List[dict]:
     return rows
 
 
-def load_centrality(centrality_dir: Path, num_slices: int) -> Tuple[Dict[int, float], Dict[int, int]]:
+def load_centrality(centrality_dir: Path, num_slices: int) -> Dict[int, float]:
     centrality: Dict[int, float] = {}
-    node_slice: Dict[int, int] = {}
     for sid in range(num_slices):
         path = centrality_dir / f"tiage_{sid}.csv"
         if not path.exists():
@@ -63,83 +59,11 @@ def load_centrality(centrality_dir: Path, num_slices: int) -> Tuple[Dict[int, fl
                 if not line:
                     continue
                 node_str, val_str = line.split(",", 1)
-                node_id = int(node_str)
-                centrality[node_id] = float(val_str)
-                node_slice[node_id] = sid
-    return centrality, node_slice
+                centrality[int(node_str)] = float(val_str)
+    return centrality
 
 
-def load_slice_graph(graph_path: Path, nodes: List[int]) -> nx.Graph:
-    g = nx.Graph()
-    g.add_nodes_from(nodes)
-    if graph_path.exists():
-        with graph_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                u_str, v_str = line.split()
-                g.add_edge(int(u_str), int(v_str))
-    return g
-
-
-def compute_louvain_feature(
-    slices_txt_dir: Path,
-    node_slice: Dict[int, int],
-    num_slices: int,
-    seed: int,
-) -> Tuple[Dict[int, float], Dict[int, float]]:
-    community_ratio: Dict[int, float] = {}
-    bridge_ratio: Dict[int, float] = {}
-
-    for sid in range(num_slices):
-        nodes = [nid for nid, s in node_slice.items() if s == sid]
-        if not nodes:
-            continue
-
-        g = load_slice_graph(slices_txt_dir / f"tiage_{sid}.txt", nodes)
-        if g.number_of_nodes() == 0:
-            continue
-
-        try:
-            communities = nx.community.louvain_communities(g, seed=seed)
-        except Exception:
-            communities = list(nx.community.greedy_modularity_communities(g))
-
-        total = float(g.number_of_nodes())
-        for comm in communities:
-            ratio = len(comm) / total
-            for nid in comm:
-                community_ratio[int(nid)] = ratio
-
-        node_to_comm: Dict[int, int] = {}
-        for ci, comm in enumerate(communities):
-            for nid in comm:
-                node_to_comm[int(nid)] = ci
-
-        eps = 1e-8
-        for nid in g.nodes():
-            deg_in = 0
-            deg_out = 0
-            c_nid = node_to_comm.get(int(nid), -1)
-            for nb in g.neighbors(nid):
-                if node_to_comm.get(int(nb), -2) == c_nid:
-                    deg_in += 1
-                else:
-                    deg_out += 1
-            deg_all = deg_in + deg_out
-            bridge_ratio[int(nid)] = float(deg_out) / float(deg_all + eps)
-
-    return community_ratio, bridge_ratio
-
-
-def build_samples(
-    rows: List[dict],
-    centrality: Dict[int, float],
-    community_ratio: Dict[int, float],
-    bridge_ratio: Dict[int, float],
-    context_turns: int,
-) -> Dict[str, List[Sample]]:
+def build_samples(rows: List[dict], centrality: Dict[int, float], context_turns: int) -> Dict[str, List[Sample]]:
     by_dialog: Dict[Tuple[str, int], List[dict]] = {}
     for r in rows:
         by_dialog.setdefault((r["split"], r["dialog_id"]), []).append(r)
@@ -162,8 +86,6 @@ def build_samples(
                 ctx_parts.append(f"{h['text']} [CEN={h_c:.4f}]")
 
             cur_c = centrality.get(cur["node_id"], 0.0)
-            cur_comm = community_ratio.get(cur["node_id"], 0.0)
-            cur_bridge = bridge_ratio.get(cur["node_id"], 0.0)
             context_text = " </s> ".join(ctx_parts) if ctx_parts else "<no_context>"
             text = (
                 f"task: topic shift detection\n"
@@ -179,8 +101,6 @@ def build_samples(
                 text=text,
                 label=label,
                 centrality=cur_c,
-                community_ratio=cur_comm,
-                bridge_ratio=cur_bridge,
             )
             if split in result:
                 result[split].append(sample)
@@ -213,10 +133,7 @@ class Collator:
             return_tensors="pt",
         )
         labels = torch.tensor([x.label for x in batch], dtype=torch.long)
-        feats = torch.tensor(
-            [[x.centrality, x.community_ratio, x.bridge_ratio] for x in batch],
-            dtype=torch.float,
-        )
+        feats = torch.tensor([[x.centrality] for x in batch], dtype=torch.float)
         return {
             "input_ids": tok["input_ids"],
             "attention_mask": tok["attention_mask"],
@@ -260,10 +177,10 @@ class T5Baseline(nn.Module):
             [RWKVChannelMix(hidden, hidden_mult=channelmix_hidden_mult, dropout=channelmix_dropout) for _ in range(max(0, channelmix_layers))]
         )
         self.attn_pool = nn.Linear(hidden, 1)
-        self.feature_norm = nn.LayerNorm(3)
-        self.gate_proj = nn.Linear(hidden + 3, hidden)
+        self.feature_norm = nn.LayerNorm(1)
+        self.gate_proj = nn.Linear(hidden + 1, hidden)
         self.classifier = nn.Sequential(
-            nn.Linear(hidden + 3, hidden),
+            nn.Linear(hidden + 1, hidden),
             nn.Tanh(),
             nn.Dropout(dropout),
             nn.Linear(hidden, 2),
@@ -335,8 +252,6 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, thresho
                     "pred": p,
                     "prob_1": float(p1),
                     "centrality": float(m.centrality),
-                    "community_ratio": float(m.community_ratio),
-                    "bridge_ratio": float(m.bridge_ratio),
                 }
             )
 
@@ -357,8 +272,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Best baseline: T5-base + centrality + ChannelMix (no oversample, no z-score)")
     parser.add_argument("--nodes_csv", type=str, default="demo/tiage-1/outputs_nodes/tiage_anno_nodes_all.csv")
     parser.add_argument("--centrality_dir", type=str, default="demo/DGCN3/Centrality/alpha_1.5")
-    parser.add_argument("--slices_txt_dir", type=str, default="demo/tiage-1/tiage_slices_txt")
-    parser.add_argument("--output_dir", type=str, default="demo/tiage-1/results_t5_base_channelmix")
+    parser.add_argument("--output_dir", type=str, default="demo/tiage-1/results_t5_base_channelmix_best_baseline")
     parser.add_argument("--model_name", type=str, default="t5-base")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -379,25 +293,17 @@ def main() -> None:
     root = Path(".").resolve()
     nodes_csv = (root / args.nodes_csv).resolve()
     centrality_dir = (root / args.centrality_dir).resolve()
-    slices_txt_dir = (root / args.slices_txt_dir).resolve()
     output_dir = (root / args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[INFO] nodes_csv={nodes_csv}")
     print(f"[INFO] centrality_dir={centrality_dir}")
-    print(f"[INFO] slices_txt_dir={slices_txt_dir}")
     print(f"[INFO] output_dir={output_dir}")
     print(f"[INFO] model={args.model_name} context_turns={args.context_turns} batch_size={args.batch_size}")
 
     rows = parse_nodes(nodes_csv)
-    centrality, node_slice = load_centrality(centrality_dir, args.num_slices)
-    community_ratio, bridge_ratio = compute_louvain_feature(
-        slices_txt_dir=slices_txt_dir,
-        node_slice=node_slice,
-        num_slices=args.num_slices,
-        seed=args.seed,
-    )
-    split_samples = build_samples(rows, centrality, community_ratio, bridge_ratio, args.context_turns)
+    centrality = load_centrality(centrality_dir, args.num_slices)
+    split_samples = build_samples(rows, centrality, args.context_turns)
     for split in ("train", "dev", "test"):
         print(f"[INFO] {split} samples={len(split_samples[split])}")
 
@@ -484,7 +390,7 @@ def main() -> None:
     save_csv(
         output_dir / "predictions.csv",
         train_rows + dev_rows + test_rows,
-        ["split", "dialog_id", "turn_id", "node_id", "label", "pred", "prob_1", "centrality", "community_ratio", "bridge_ratio"],
+        ["split", "dialog_id", "turn_id", "node_id", "label", "pred", "prob_1", "centrality"],
     )
 
     print("[RESULT] Test metrics")
